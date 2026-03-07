@@ -231,14 +231,76 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
 
             # Subscribe to notifications
             self._reassembler.reset()
+
+            # Log available services/characteristics for diagnostics
+            for service in client.services:
+                for char in service.characteristics:
+                    props = ",".join(char.properties)
+                    _LOGGER.debug(
+                        "  Char %s [%s] props=%s descriptors=%d",
+                        char.uuid,
+                        char.handle,
+                        props,
+                        len(char.descriptors),
+                    )
+                    for desc in char.descriptors:
+                        _LOGGER.debug(
+                            "    Descriptor %s [%s]", desc.uuid, desc.handle
+                        )
+
             await client.start_notify(NOTIFY_UUID, self._notification_handler)
+            _LOGGER.info(
+                "Notification subscription sent for %s — "
+                "waiting 1.5s for CCCD write to propagate via proxy",
+                NOTIFY_UUID,
+            )
+
+            # Give the ESPHome proxy time to forward the CCCD write
+            # to the actual device before sending commands
+            await asyncio.sleep(1.5)
+
+            # Also try to manually write CCCD descriptor (0x2902)
+            # as a fallback in case start_notify didn't propagate
+            try:
+                notify_char = client.services.get_characteristic(NOTIFY_UUID)
+                if notify_char:
+                    for desc in notify_char.descriptors:
+                        if "2902" in str(desc.uuid):
+                            _LOGGER.info(
+                                "Manually writing CCCD descriptor %s "
+                                "(handle %s) to enable notifications",
+                                desc.uuid,
+                                desc.handle,
+                            )
+                            await client.write_gatt_descriptor(
+                                desc.handle, b"\x01\x00"
+                            )
+                            await asyncio.sleep(0.5)
+                            break
+                    else:
+                        _LOGGER.debug("No CCCD descriptor found on notify char")
+                else:
+                    _LOGGER.warning("Notify characteristic %s not found", NOTIFY_UUID)
+            except BleakError as e:
+                _LOGGER.debug("CCCD manual write failed (may be OK): %s", e)
 
             # === Protocol V2 init sequence (from HCI snoop) ===
 
             # 1. Sync time
             _LOGGER.debug("Syncing time...")
             await self._write_command(client, build_sync_time())
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(2.0)
+
+            # Quick check: did we get ANY notification after sync_time?
+            if self._data.device_info or self._data.battery_level is not None:
+                _LOGGER.info("Notification received after sync_time — protocol working")
+            else:
+                _LOGGER.warning(
+                    "No notification received after sync_time + 2s wait. "
+                    "Possible causes: (1) ESPHome proxy not forwarding "
+                    "notifications, (2) device not responding to V2 commands. "
+                    "Continuing with remaining commands..."
+                )
 
             # 2. Get device info
             _LOGGER.debug("Requesting device info (CMD 0x00)...")
