@@ -235,23 +235,62 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                     )
             # --- END DEBUG ---
 
-            # Subscribe to notifications
+            # Subscribe to notifications on BOTH the notify characteristic
+            # and the write characteristic (some variants respond on either)
             self._reassembler.reset()
+            _LOGGER.info("Subscribing to notifications on NOTIFY_UUID...")
             await client.start_notify(NOTIFY_UUID, self._notification_handler)
+            _LOGGER.info("Notification subscription successful on NOTIFY_UUID")
 
-            # Sync time
-            _LOGGER.debug("Syncing time...")
-            await self._write_command(client, build_sync_time())
+            # Also try subscribing on WRITE_UUID in case device notifies there
+            try:
+                _LOGGER.info("Subscribing to notifications on WRITE_UUID...")
+                await client.start_notify(WRITE_UUID, self._notification_handler)
+                _LOGGER.info("Notification subscription successful on WRITE_UUID")
+            except BleakError as e:
+                _LOGGER.debug("WRITE_UUID doesn't support notify (expected): %s", e)
+
+            # Try writing to NOTIFY characteristic (bidirectional pattern)
+            # Some Lepu variants expect commands on the notify char
+            _LOGGER.debug("Syncing time (via NOTIFY char)...")
+            sync_cmd = build_sync_time()
+            try:
+                await client.write_gatt_char(NOTIFY_UUID, sync_cmd, response=True)
+                _LOGGER.debug("Sent sync_time to NOTIFY_UUID: %s", sync_cmd.hex())
+            except BleakError as e:
+                _LOGGER.debug("Write to NOTIFY_UUID failed: %s", e)
+            await asyncio.sleep(0.5)
+
+            # Also try the original WRITE characteristic
+            _LOGGER.debug("Syncing time (via WRITE char)...")
+            await self._write_command(client, sync_cmd)
+            await asyncio.sleep(0.5)
+
+            # Request device info on both characteristics
+            info_cmd = build_get_info()
+            _LOGGER.debug("Requesting device info (via NOTIFY char)...")
+            try:
+                await client.write_gatt_char(NOTIFY_UUID, info_cmd, response=True)
+                _LOGGER.debug("Sent get_info to NOTIFY_UUID: %s", info_cmd.hex())
+            except BleakError as e:
+                _LOGGER.debug("Write get_info to NOTIFY_UUID failed: %s", e)
+            await asyncio.sleep(0.5)
+
+            _LOGGER.debug("Requesting device info (via WRITE char)...")
+            await self._write_command(client, info_cmd)
+            await asyncio.sleep(0.5)
+
+            # Request file list
+            file_cmd = build_get_file_list()
+            _LOGGER.debug("Requesting file list (via NOTIFY char)...")
+            try:
+                await client.write_gatt_char(NOTIFY_UUID, file_cmd, response=True)
+            except BleakError as e:
+                _LOGGER.debug("Write file_list to NOTIFY_UUID failed: %s", e)
             await asyncio.sleep(0.3)
 
-            # Request device info
-            _LOGGER.debug("Requesting device info...")
-            await self._write_command(client, build_get_info())
-            await asyncio.sleep(0.3)
-
-            # Request file list (stored measurements)
-            _LOGGER.debug("Requesting file list...")
-            await self._write_command(client, build_get_file_list())
+            _LOGGER.debug("Requesting file list (via WRITE char)...")
+            await self._write_command(client, file_cmd)
 
             # Wait for initial data (RT result or first file parse)
             try:
