@@ -68,22 +68,10 @@ MAX_STORED_MEASUREMENTS = 50
 # Maximum BLE connection retries
 MAX_CONNECT_RETRIES = 3
 
-# Alternative BLE characteristic UUIDs (8ec9XXXX service)
-# Some LP-BP2W devices use this service instead of the Lepu service
+# Alternative BLE characteristic UUID (8ec9XXXX service)
+# The LP-BP2W uses 8ec90001 as a transport layer: commands are written here
+# and ACKs come back, while actual protocol responses arrive on NOTIFY_UUID.
 ALT_NOTIFY_UUID = "8ec90001-f315-4f60-9fb8-838830daea50"
-ALT_WRITE_UUID = "8ec90002-f315-4f60-9fb8-838830daea50"
-
-# All candidate (write_uuid, notify_uuid, label) combinations to probe
-_CHAR_CANDIDATES = [
-    # 1. Standard Lepu: write to 8b00ace7, notify on 0734594a
-    (WRITE_UUID, NOTIFY_UUID, "Lepu write→notify"),
-    # 2. Alt service: write to 8ec90002 (w-o-r), notify on 8ec90001
-    (ALT_WRITE_UUID, ALT_NOTIFY_UUID, "Alt 8ec9 write→notify"),
-    # 3. Alt single-char: write to 8ec90001 (write+notify), notify on same
-    (ALT_NOTIFY_UUID, ALT_NOTIFY_UUID, "Alt 8ec9 single-char"),
-    # 4. Cross-service: write to Lepu 8b00ace7, notify on Alt 8ec90001
-    (WRITE_UUID, ALT_NOTIFY_UUID, "Lepu write→Alt notify"),
-]
 
 
 class ViatomBP2Data:
@@ -182,9 +170,8 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         self._current_client: BleakClient | None = None
         self._last_disconnect: float = 0  # monotonic timestamp
         self._notification_received = asyncio.Event()
-        # Active write UUID (may change during probing)
+        # Active write UUID — set during connect to transport layer char
         self._active_write_uuid: str = WRITE_UUID
-        self._active_notify_uuid: str = NOTIFY_UUID
 
     @property
     def bp_data(self) -> ViatomBP2Data:
@@ -262,31 +249,52 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                         len(char.descriptors),
                     )
 
-            # === Probe characteristic combinations ===
-            working_combo = await self._probe_characteristics(client)
+            # === Dual-subscribe approach ===
+            # The LP-BP2W uses a two-layer architecture:
+            #   - Transport layer on 8ec90001 (write commands here, get ACKs)
+            #   - Application layer on 0734594a (protocol responses arrive here)
+            # We subscribe to BOTH and write through 8ec90001.
 
-            if not working_combo:
-                _LOGGER.error(
-                    "No working characteristic combination found for %s. "
-                    "Tried all %d candidates — device may need direct "
-                    "Bluetooth (not ESPHome proxy) or a different protocol.",
-                    self.address,
-                    len(_CHAR_CANDIDATES),
+            # Subscribe to Lepu application layer (actual protocol responses)
+            try:
+                await client.start_notify(
+                    NOTIFY_UUID, self._notification_handler
                 )
-                return
+                _LOGGER.info(
+                    "Subscribed to Lepu notify char %s", NOTIFY_UUID[:12]
+                )
+            except BleakError as e:
+                _LOGGER.warning(
+                    "Failed to subscribe to Lepu notify %s: %s",
+                    NOTIFY_UUID[:12],
+                    e,
+                )
 
-            write_uuid, notify_uuid, label = working_combo
-            self._active_write_uuid = write_uuid
-            self._active_notify_uuid = notify_uuid
+            # Subscribe to transport layer (ACKs, may also carry data)
+            try:
+                await client.start_notify(
+                    ALT_NOTIFY_UUID, self._transport_handler
+                )
+                _LOGGER.info(
+                    "Subscribed to transport char %s", ALT_NOTIFY_UUID[:12]
+                )
+            except BleakError as e:
+                _LOGGER.warning(
+                    "Failed to subscribe to transport %s: %s",
+                    ALT_NOTIFY_UUID[:12],
+                    e,
+                )
+
+            # Give CCCD writes time to propagate through ESPHome proxy
+            await asyncio.sleep(1.5)
+
+            # Use 8ec90001 as the write characteristic
+            self._active_write_uuid = ALT_NOTIFY_UUID
             _LOGGER.info(
-                "Working characteristic combo: %s "
-                "(write=%s, notify=%s)",
-                label,
-                write_uuid,
-                notify_uuid,
+                "Using write char: %s (transport layer)", ALT_NOTIFY_UUID[:12]
             )
 
-            # === Continue with full Protocol V2 init sequence ===
+            # === Run Protocol V2 init sequence ===
             await self._run_init_sequence(client)
 
         except BleakError as e:
@@ -300,119 +308,11 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             self._connecting = False
             self.async_set_updated_data(self._data)
 
-    async def _probe_characteristics(
-        self, client: BleakClient
-    ) -> tuple[str, str, str] | None:
-        """Probe all characteristic combinations to find one that works.
-
-        Sends a sync_time command on each write UUID while listening for
-        notifications on each notify UUID. Returns the first combo that
-        yields a response, or None if none work.
-        """
-        self._reassembler.reset()
-
-        for write_uuid, notify_uuid, label in _CHAR_CANDIDATES:
-            # Check that both characteristics exist on this device
-            write_char = client.services.get_characteristic(write_uuid)
-            notify_char = client.services.get_characteristic(notify_uuid)
-            if not write_char or not notify_char:
-                _LOGGER.debug(
-                    "Skipping combo '%s': characteristic not found "
-                    "(write=%s notify=%s)",
-                    label,
-                    write_char is not None,
-                    notify_char is not None,
-                )
-                continue
-
-            # Check that notify char supports notifications
-            if "notify" not in notify_char.properties:
-                _LOGGER.debug(
-                    "Skipping combo '%s': notify char lacks notify property",
-                    label,
-                )
-                continue
-
-            _LOGGER.info(
-                "=== Probing combo '%s': write=%s notify=%s ===",
-                label,
-                write_uuid[:12],
-                notify_uuid[:12],
-            )
-
-            # Subscribe to notifications on this char
-            self._notification_received.clear()
-            try:
-                await client.start_notify(
-                    notify_uuid, self._notification_handler
-                )
-            except BleakError as e:
-                _LOGGER.debug(
-                    "Failed to subscribe on %s: %s", notify_uuid[:12], e
-                )
-                continue
-
-            # Give CCCD write time to propagate through ESPHome proxy
-            await asyncio.sleep(1.0)
-
-            # Send sync_time command on the write char
-            try:
-                cmd = build_sync_time()
-                # Determine write mode based on characteristic properties
-                use_response = "write-without-response" not in write_char.properties
-                await client.write_gatt_char(
-                    write_uuid, cmd, response=use_response
-                )
-                _LOGGER.info(
-                    "Sent sync_time on %s (response=%s): %s",
-                    write_uuid[:12],
-                    use_response,
-                    cmd.hex(),
-                )
-            except BleakError as e:
-                _LOGGER.debug(
-                    "Failed to write on %s: %s", write_uuid[:12], e
-                )
-                try:
-                    await client.stop_notify(notify_uuid)
-                except BleakError:
-                    pass
-                continue
-
-            # Wait for ANY notification to come back
-            try:
-                await asyncio.wait_for(
-                    self._notification_received.wait(), timeout=3.0
-                )
-                _LOGGER.info(
-                    "Got notification on combo '%s'! This is the working pair.",
-                    label,
-                )
-                # Don't unsubscribe — keep this subscription active
-                return (write_uuid, notify_uuid, label)
-            except TimeoutError:
-                _LOGGER.info(
-                    "No response on combo '%s' after 3s", label
-                )
-
-            # Clean up this subscription before trying next combo
-            try:
-                await client.stop_notify(notify_uuid)
-            except BleakError:
-                pass
-            await asyncio.sleep(0.3)
-
-        return None
-
     async def _run_init_sequence(self, client: BleakClient) -> None:
-        """Run the full Protocol V2 init sequence after finding working chars."""
-        write_uuid = self._active_write_uuid
-
-        # sync_time was already sent during probing, but send again
-        # to ensure clean state
+        """Run the full Protocol V2 init sequence."""
         _LOGGER.debug("Sending full init sequence...")
 
-        # 1. Sync time (re-send for clean state)
+        # 1. Sync time
         await self._write_command(client, build_sync_time())
         await asyncio.sleep(0.5)
 
@@ -502,6 +402,33 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         )
         # Signal that we received at least one notification (for probing)
         self._notification_received.set()
+        self.hass.loop.call_soon_threadsafe(self._reassembler.feed, raw)
+
+    def _transport_handler(
+        self, _sender: Any, data: bytearray
+    ) -> None:
+        """Handle notifications from the transport layer (8ec90001).
+
+        The LP-BP2W sends short ACK frames (e.g. 60 a5 02) on this
+        characteristic for every command written.  These are NOT Lepu
+        protocol packets — just transport-level acknowledgements.  We
+        log them for diagnostics and also forward the raw bytes to the
+        reassembler in case the device ever sends full protocol frames
+        on this channel.
+        """
+        raw = bytes(data)
+        _LOGGER.debug(
+            "Transport notification (%d bytes): %s", len(raw), raw.hex()
+        )
+        # Short frames (≤4 bytes) are ACKs — log and skip
+        if len(raw) <= 4:
+            _LOGGER.debug("Transport ACK: %s", raw.hex())
+            return
+        # Longer frames may carry protocol data — feed to reassembler
+        _LOGGER.info(
+            "Transport layer sent %d-byte frame, feeding to reassembler",
+            len(raw),
+        )
         self.hass.loop.call_soon_threadsafe(self._reassembler.feed, raw)
 
     def _handle_packet(self, packet: LepuPacket) -> None:
@@ -663,8 +590,8 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         """Disconnect from the BP2."""
         try:
             if client.is_connected:
-                # Stop notifications on whichever char was active
-                for uuid in {self._active_notify_uuid, NOTIFY_UUID, ALT_NOTIFY_UUID}:
+                # Stop notifications on both subscribed characteristics
+                for uuid in (NOTIFY_UUID, ALT_NOTIFY_UUID):
                     try:
                         await client.stop_notify(uuid)
                     except BleakError:
