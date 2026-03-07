@@ -221,6 +221,20 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             self._connected = True
             _LOGGER.info("Connected to BP2 at %s", self.address)
 
+            # --- DEBUG: dump all GATT services so we can verify UUIDs ---
+            for service in client.services:
+                _LOGGER.info(
+                    "GATT Service: %s (handle %s)",
+                    service.uuid, service.handle,
+                )
+                for char in service.characteristics:
+                    props = ",".join(char.properties)
+                    _LOGGER.info(
+                        "  Characteristic: %s [%s] (handle %s)",
+                        char.uuid, props, char.handle,
+                    )
+            # --- END DEBUG ---
+
             # Subscribe to notifications
             self._reassembler.reset()
             await client.start_notify(NOTIFY_UUID, self._notification_handler)
