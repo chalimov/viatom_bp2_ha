@@ -221,6 +221,16 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             self._connected = True
             _LOGGER.info("Connected to BP2 at %s", self.address)
 
+            # Attempt BLE pairing/bonding — some Nordic devices require this
+            # before they respond to any application-level commands
+            try:
+                is_paired = await client.pair(protection_level=None)
+                _LOGGER.info("BLE pairing result: %s", is_paired)
+            except (BleakError, NotImplementedError, AttributeError) as e:
+                _LOGGER.info("BLE pairing not available or not needed: %s", e)
+            except Exception as e:
+                _LOGGER.debug("BLE pairing attempt failed: %s", e)
+
             # --- DEBUG: dump all GATT services so we can verify UUIDs ---
             for service in client.services:
                 _LOGGER.info(
@@ -235,62 +245,44 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                     )
             # --- END DEBUG ---
 
-            # Subscribe to notifications on BOTH the notify characteristic
-            # and the write characteristic (some variants respond on either)
+            # --- DIAGNOSTIC: Try reading all readable characteristics ---
+            _LOGGER.info("=== DIAGNOSTIC: Reading all characteristics ===")
+            for service in client.services:
+                for char in service.characteristics:
+                    if "read" in char.properties:
+                        try:
+                            val = await client.read_gatt_char(char.uuid)
+                            _LOGGER.info(
+                                "  READ %s => %s (%s)",
+                                char.uuid, val.hex(), repr(val),
+                            )
+                        except BleakError as e:
+                            _LOGGER.info("  READ %s => FAILED: %s", char.uuid, e)
+
+            # Subscribe to notifications
             self._reassembler.reset()
             _LOGGER.info("Subscribing to notifications on NOTIFY_UUID...")
             await client.start_notify(NOTIFY_UUID, self._notification_handler)
-            _LOGGER.info("Notification subscription successful on NOTIFY_UUID")
+            _LOGGER.info("Notification subscription OK")
 
-            # Also try subscribing on WRITE_UUID in case device notifies there
-            try:
-                _LOGGER.info("Subscribing to notifications on WRITE_UUID...")
-                await client.start_notify(WRITE_UUID, self._notification_handler)
-                _LOGGER.info("Notification subscription successful on WRITE_UUID")
-            except BleakError as e:
-                _LOGGER.debug("WRITE_UUID doesn't support notify (expected): %s", e)
-
-            # Try writing to NOTIFY characteristic (bidirectional pattern)
-            # Some Lepu variants expect commands on the notify char
-            _LOGGER.debug("Syncing time (via NOTIFY char)...")
-            sync_cmd = build_sync_time()
-            try:
-                await client.write_gatt_char(NOTIFY_UUID, sync_cmd, response=True)
-                _LOGGER.debug("Sent sync_time to NOTIFY_UUID: %s", sync_cmd.hex())
-            except BleakError as e:
-                _LOGGER.debug("Write to NOTIFY_UUID failed: %s", e)
+            # Send commands via WRITE characteristic
+            _LOGGER.debug("Syncing time...")
+            await self._write_command(client, build_sync_time())
             await asyncio.sleep(0.5)
 
-            # Also try the original WRITE characteristic
-            _LOGGER.debug("Syncing time (via WRITE char)...")
-            await self._write_command(client, sync_cmd)
+            _LOGGER.debug("Requesting device info...")
+            await self._write_command(client, build_get_info())
             await asyncio.sleep(0.5)
 
-            # Request device info on both characteristics
-            info_cmd = build_get_info()
-            _LOGGER.debug("Requesting device info (via NOTIFY char)...")
-            try:
-                await client.write_gatt_char(NOTIFY_UUID, info_cmd, response=True)
-                _LOGGER.debug("Sent get_info to NOTIFY_UUID: %s", info_cmd.hex())
-            except BleakError as e:
-                _LOGGER.debug("Write get_info to NOTIFY_UUID failed: %s", e)
-            await asyncio.sleep(0.5)
+            _LOGGER.debug("Requesting file list...")
+            await self._write_command(client, build_get_file_list())
 
-            _LOGGER.debug("Requesting device info (via WRITE char)...")
-            await self._write_command(client, info_cmd)
-            await asyncio.sleep(0.5)
-
-            # Request file list
-            file_cmd = build_get_file_list()
-            _LOGGER.debug("Requesting file list (via NOTIFY char)...")
-            try:
-                await client.write_gatt_char(NOTIFY_UUID, file_cmd, response=True)
-            except BleakError as e:
-                _LOGGER.debug("Write file_list to NOTIFY_UUID failed: %s", e)
-            await asyncio.sleep(0.3)
-
-            _LOGGER.debug("Requesting file list (via WRITE char)...")
-            await self._write_command(client, file_cmd)
+            # Wait 3 seconds, then check if ANY notifications arrived
+            await asyncio.sleep(3)
+            _LOGGER.info(
+                "=== After 3s wait: notifications received = %s ===",
+                "YES" if self._got_result.is_set() else "NO",
+            )
 
             # Wait for initial data (RT result or first file parse)
             try:
