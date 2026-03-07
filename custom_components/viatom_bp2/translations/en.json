@@ -1,0 +1,50 @@
+{
+  "config": {
+    "flow_title": "Viatom BP2 ({name})",
+    "step": {
+      "user": {
+        "title": "Select your Viatom BP2",
+        "description": "Choose the blood pressure monitor to add.",
+        "data": {
+          "address": "Device"
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "Confirm Viatom BP2",
+        "description": "Found **{name}** — do you want to set it up?"
+      }
+    },
+    "abort": {
+      "already_configured": "This device is already configured.",
+      "no_devices_found": "No Viatom BP2 devices found. Make sure the device is powered on and within range of your BLE proxy."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "systolic": {
+        "name": "Systolic"
+      },
+      "diastolic": {
+        "name": "Diastolic"
+      },
+      "pulse": {
+        "name": "Pulse"
+      },
+      "mean_arterial_pressure": {
+        "name": "Mean Arterial Pressure"
+      },
+      "measurement_time": {
+        "name": "Last Measurement Time"
+      },
+      "battery_level": {
+        "name": "Battery"
+      },
+      "rssi": {
+        "name": "Signal Strength"
+      },
+      "irregular_heartbeat": {
+        "name": "Irregular Heartbeat"
+      }
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "domain": "viatom_bp2",
+  "name": "Viatom BP2 Blood Pressure Monitor",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": ["bluetooth", "bluetooth_adapters"],
+  "documentation": "https://github.com/example/ha-viatom-bp2",
+  "bluetooth": [
+    {
+      "service_uuid": "14839ac4-7d7e-415c-9a42-167340cf2339",
+      "connectable": true
+    },
+    {
+      "local_name": "BP2*",
+      "connectable": true
+    },
+    {
+      "local_name": "BP2A*",
+      "connectable": true
+    }
+  ],
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "requirements": ["bleak>=0.21.1", "bleak-retry-connector>=3.4.0"],
+  "version": "0.1.0"
+}
