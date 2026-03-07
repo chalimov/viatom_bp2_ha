@@ -1,33 +1,25 @@
 """Viatom BP2W BLE protocol handler.
 
 This module implements the Lepu BLE protocol V2 used by Viatom LP-BP2W
-blood pressure monitors. The protocol was reverse-engineered from
-HCI snoop log captures of the official ViHealth Android app.
+blood pressure monitors. The protocol was reverse-engineered from the
+LepuDemo SDK (blepro AAR) and verified with direct BLE testing.
 
 Protocol frame format:
-  [Header(1)] [Cmd(1)] [~Cmd(1)] [SeqLo(1)] [SeqHi(1)] [LenLo(1)] [LenHi(1)] [Payload(N)] [CRC8(1)]
+  [Header(1)] [Cmd(1)] [~Cmd(1)] [0x00(1)] [SeqNo(1)] [LenLo(1)] [LenHi(1)] [Payload(N)] [CRC8(1)]
 
 Header: 0xA5
 Cmd: command type byte
 ~Cmd: bitwise NOT of Cmd
-SeqLo: TX/RX flag (0x00=TX, 0x01=RX)
-SeqHi: command counter (increments per command sent)
+Byte 3: always 0x00 for TX, 0x01 for RX
+Byte 4: sequence counter (increments per command sent)
 Length: 2-byte little-endian payload length
 Payload: variable length data
-CRC8: CRC-8/MAXIM over payload bytes (0x00 if no payload)
+CRC8: CRC-8/CCITT over ALL preceding bytes (bytes[0..N-2])
 
-Key differences from protocol V1:
-  - CMD_SYNC_TIME = 0xC0 (not 0x0C), uses structured datetime payload
-  - CMD_GET_INFO = 0x00 (not 0x14)
-  - CMD_GET_DEVICE_INFO = 0xE1 (new)
-  - CMD_GET_CONFIG = 0x33 (not 0x20)
-  - CMD_GET_BATTERY = 0x30 (new)
-  - CMD_READ_FILE_START = 0xF2 (not 0x1A), uses 20-byte padded filename
-  - CMD_READ_FILE_DATA = 0xF3 (not 0x1C)
-  - CMD_READ_FILE_END = 0xF4 (not 0x1E)
-  - CMD_RT_DATA = 0x08 (not 0x16), pushed by device
-  - Writes MUST use write-without-response (WRITE_CMD, not WRITE_REQ)
-  - Seq number: byte3 = 0x00 for TX / 0x01 for RX, byte4 = counter
+CRITICAL: CRC is CRC-8/CCITT (poly 0x07), NOT CRC-8/MAXIM!
+This was the root cause of all previous communication failures.
+The CRC is computed over the ENTIRE packet (header through payload),
+not just the payload alone.
 """
 
 from __future__ import annotations
@@ -43,31 +35,53 @@ _LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# CRC-8 / MAXIM (polynomial 0x31, init 0x00, refin=True, refout=True)
+# CRC-8/CCITT (polynomial 0x07) — from BleCRC.java in LepuBle SDK
 # ---------------------------------------------------------------------------
-_CRC8_TABLE = [0] * 256
-
-
-def _init_crc8_table() -> None:
-    poly = 0x8C  # reversed 0x31
-    for i in range(256):
-        crc = i
-        for _ in range(8):
-            if crc & 1:
-                crc = (crc >> 1) ^ poly
-            else:
-                crc >>= 1
-        _CRC8_TABLE[i] = crc
-
-
-_init_crc8_table()
+_CRC8_TABLE = [
+    0x00, 0x07, 0x0E, 0x09, 0x1C, 0x1B, 0x12, 0x15,
+    0x38, 0x3F, 0x36, 0x31, 0x24, 0x23, 0x2A, 0x2D,
+    0x70, 0x77, 0x7E, 0x79, 0x6C, 0x6B, 0x62, 0x65,
+    0x48, 0x4F, 0x46, 0x41, 0x54, 0x53, 0x5A, 0x5D,
+    0xE0, 0xE7, 0xEE, 0xE9, 0xFC, 0xFB, 0xF2, 0xF5,
+    0xD8, 0xDF, 0xD6, 0xD1, 0xC4, 0xC3, 0xCA, 0xCD,
+    0x90, 0x97, 0x9E, 0x99, 0x8C, 0x8B, 0x82, 0x85,
+    0xA8, 0xAF, 0xA6, 0xA1, 0xB4, 0xB3, 0xBA, 0xBD,
+    0xC7, 0xC0, 0xC9, 0xCE, 0xDB, 0xDC, 0xD5, 0xD2,
+    0xFF, 0xF8, 0xF1, 0xF6, 0xE3, 0xE4, 0xED, 0xEA,
+    0xB7, 0xB0, 0xB9, 0xBE, 0xAB, 0xAC, 0xA5, 0xA2,
+    0x8F, 0x88, 0x81, 0x86, 0x93, 0x94, 0x9D, 0x9A,
+    0x27, 0x20, 0x29, 0x2E, 0x3B, 0x3C, 0x35, 0x32,
+    0x1F, 0x18, 0x11, 0x16, 0x03, 0x04, 0x0D, 0x0A,
+    0x57, 0x50, 0x59, 0x5E, 0x4B, 0x4C, 0x45, 0x42,
+    0x6F, 0x68, 0x61, 0x66, 0x73, 0x74, 0x7D, 0x7A,
+    0x89, 0x8E, 0x87, 0x80, 0x95, 0x92, 0x9B, 0x9C,
+    0xB1, 0xB6, 0xBF, 0xB8, 0xAD, 0xAA, 0xA3, 0xA4,
+    0xF9, 0xFE, 0xF7, 0xF0, 0xE5, 0xE2, 0xEB, 0xEC,
+    0xC1, 0xC6, 0xCF, 0xC8, 0xDD, 0xDA, 0xD3, 0xD4,
+    0x69, 0x6E, 0x67, 0x60, 0x75, 0x72, 0x7B, 0x7C,
+    0x51, 0x56, 0x5F, 0x58, 0x4D, 0x4A, 0x43, 0x44,
+    0x19, 0x1E, 0x17, 0x10, 0x05, 0x02, 0x0B, 0x0C,
+    0x21, 0x26, 0x2F, 0x28, 0x3D, 0x3A, 0x33, 0x34,
+    0x4E, 0x49, 0x40, 0x47, 0x52, 0x55, 0x5C, 0x5B,
+    0x76, 0x71, 0x78, 0x7F, 0x6A, 0x6D, 0x64, 0x63,
+    0x3E, 0x39, 0x30, 0x37, 0x22, 0x25, 0x2C, 0x2B,
+    0x06, 0x01, 0x08, 0x0F, 0x1A, 0x1D, 0x14, 0x13,
+    0xAE, 0xA9, 0xA0, 0xA7, 0xB2, 0xB5, 0xBC, 0xBB,
+    0x96, 0x91, 0x98, 0x9F, 0x8A, 0x8D, 0x84, 0x83,
+    0xDE, 0xD9, 0xD0, 0xD7, 0xC2, 0xC5, 0xCC, 0xCB,
+    0xE6, 0xE1, 0xE8, 0xEF, 0xFA, 0xFD, 0xF4, 0xF3,
+]
 
 
 def crc8(data: bytes) -> int:
-    """Calculate CRC-8/MAXIM over data."""
-    crc = 0x00
+    """Calculate CRC-8/CCITT over data.
+
+    This is used over bytes[0..N-2] of the packet (everything except
+    the CRC byte itself).
+    """
+    crc = 0
     for b in data:
-        crc = _CRC8_TABLE[crc ^ b]
+        crc = _CRC8_TABLE[0xFF & (crc ^ b)]
     return crc
 
 
@@ -96,11 +110,28 @@ class BpResult:
 
 @dataclass
 class DeviceInfo:
-    """BP2 device information."""
+    """BP2 device information from CMD 0xE1 (GET_DEVICE_INFO).
+
+    Response layout (60 bytes from probe log):
+      byte 0: hardware_version major
+      bytes 1-2: unknown
+      byte 3: software_version major
+      byte 4: software_version minor
+      bytes 5-7: unknown
+      byte 8: model_str_len
+      bytes 9..9+model_str_len: model string (ASCII)
+      then: firmware date bytes, serial number, etc.
+
+    Actual hex from device:
+      42 00 01 01 01 00 00 01 00  33323132303031 31
+      05 00 00 22 86 03 01 ea 07 03 07 17 06 37 02 01
+      00 00 00 00 0a 32353233433030383132 00...
+    """
 
     hw_version: str = ""
     fw_version: str = ""
     serial_number: str = ""
+    model: str = ""
     battery_level: int = 0
     battery_status: int = 0
     device_status: int = 0
@@ -111,7 +142,6 @@ class RtData:
     """Real-time data from BP2 (CMD 0x08).
 
     Pushed by the device continuously while active.
-    Payload is 32 bytes; layout reverse-engineered from HCI snoop.
     """
 
     device_status: int = 0
@@ -127,59 +157,95 @@ class RtData:
 
 
 # ---------------------------------------------------------------------------
-# Protocol V2 command codes (from HCI snoop of ViHealth app)
+# Protocol V2 command codes
+#
+# Two command sets work on LP-BP2W:
+#   1. LP-BP2W specific (from iffb.class in blepro AAR)
+#   2. Standard BP2 (from UniversalBleCmd.java in LepuBle)
+# Both verified working with direct BLE probe.
 # ---------------------------------------------------------------------------
-CMD_GET_INFO = 0x00
-CMD_RT_DATA = 0x08
-CMD_GET_BATTERY = 0x30
-CMD_GET_CONFIG = 0x33
-CMD_SYNC_TIME = 0xC0
-CMD_GET_DEVICE_INFO = 0xE1
-CMD_READ_FILE_START = 0xF2
-CMD_READ_FILE_DATA = 0xF3
-CMD_READ_FILE_END = 0xF4
 
-# Device status codes
-STATUS_READY = 3
-STATUS_BP_MEASURING = 4
-STATUS_BP_MEASURE_END = 5
+# LP-BP2W specific commands (from decompiled iffb.class)
+CMD_GET_INFO = 0x00           # LP-BP2W GET_INFO (returns 40-byte device info)
+CMD_FACTORY_RESET = 0x04
+CMD_GET_CONFIG = 0x06
+CMD_RT_DATA = 0x08            # Real-time data (BP measurement in progress)
+CMD_SWITCH_STATE = 0x09
+CMD_ECHO = 0x0A               # Echo / ping (returns empty ACK)
+CMD_GET_FILE_LIST = 0x11      # LP-BP2W file list
+CMD_LP_READ_FILE_START = 0x12 # LP-BP2W file read start
+CMD_LP_READ_FILE_DATA = 0x13  # LP-BP2W file read data
+
+# Standard BP2 commands (from UniversalBleCmd.java — also work on LP-BP2W)
+CMD_GET_DEVICE_INFO = 0xE1    # Standard GET_INFO (returns 60-byte info w/ serial)
+CMD_RESET = 0xE2
+CMD_FACTORY_RESET_STD = 0xE3
+CMD_SYNC_TIME = 0xEC          # Sync time
+CMD_READ_FILE_LIST = 0xF1     # Standard file list
+CMD_READ_FILE_START = 0xF2    # Standard file read start
+CMD_READ_FILE_DATA = 0xF3     # Standard file read data chunk
+CMD_READ_FILE_END = 0xF4      # Standard file read end
+
+# Device status codes (from Bp2BleInterface.kt)
+STATUS_READY = 0
+STATUS_BP_MEASURING = 1       # RT data type 0 = BP measuring
+STATUS_BP_MEASURE_END = 1     # RT data type 1 = BP end (result available)
+STATUS_ECG_MEASURING = 2
+STATUS_ECG_END = 3
 
 # Known filenames on the device
 FILE_USER_LIST = "user.list"
 FILE_BP_LIST = "bp2nibp.list"
+
+# Battery level constants from CMD 0x00 response
+CMD_GET_BATTERY = 0x30        # LP-BP2W battery command
+CMD_RT_STATE = 0x31
+CMD_RT_PRESSURE = 0x32
+CMD_GET_LP_CONFIG = 0x33      # LP-BP2W config
 
 
 # ---------------------------------------------------------------------------
 # Packet builder / parser
 # ---------------------------------------------------------------------------
 class LepuPacket:
-    """Represents a single Lepu protocol V2 packet."""
+    """Represents a single Lepu protocol V2 packet.
+
+    Wire format:
+      [0]     0xA5 header
+      [1]     cmd
+      [2]     ~cmd (bitwise NOT)
+      [3]     0x00 (TX) or 0x01 (RX)
+      [4]     sequence counter
+      [5]     length low byte
+      [6]     length high byte
+      [7..N-2] payload
+      [N-1]   CRC-8/CCITT over bytes[0..N-2]
+    """
 
     HEADER = 0xA5
 
     def __init__(self, cmd: int, payload: bytes = b"", seq: int = 0):
         self.cmd = cmd
         self.payload = payload
-        self.seq = seq
+        self.seq = seq  # sequence counter (0-255)
 
     def encode(self) -> bytes:
         """Encode the packet to bytes for transmission."""
         cmd_inv = (~self.cmd) & 0xFF
         length = len(self.payload)
-        # Header + Cmd + ~Cmd + SeqLo + SeqHi + LenLo + LenHi + Payload + CRC8
-        header = struct.pack(
-            "<BBBHH",
-            self.HEADER,
-            self.cmd,
-            cmd_inv,
-            self.seq & 0xFFFF,
-            length,
-        )
-        if length > 0:
-            crc = crc8(self.payload)
-        else:
-            crc = 0
-        return header + self.payload + bytes([crc])
+        # Build packet without CRC
+        pkt = bytearray()
+        pkt.append(self.HEADER)             # [0] header
+        pkt.append(self.cmd & 0xFF)         # [1] command
+        pkt.append(cmd_inv)                 # [2] ~command
+        pkt.append(0x00)                    # [3] TX flag (always 0x00)
+        pkt.append(self.seq & 0xFF)         # [4] sequence counter
+        pkt.append(length & 0xFF)           # [5] length low
+        pkt.append((length >> 8) & 0xFF)    # [6] length high
+        pkt.extend(self.payload)            # [7..7+len-1] payload
+        # CRC over ALL bytes so far (everything except the CRC byte itself)
+        pkt.append(crc8(bytes(pkt)))
+        return bytes(pkt)
 
     @classmethod
     def decode(cls, data: bytes) -> LepuPacket | None:
@@ -196,52 +262,125 @@ class LepuPacket:
                 "Cmd/~Cmd mismatch: 0x%02X vs 0x%02X", cmd, cmd_inv
             )
             return None
-        seq = struct.unpack_from("<H", data, 3)[0]
-        length = struct.unpack_from("<H", data, 5)[0]
-        if len(data) < 7 + length + 1:
+        # Bytes [3] = TX/RX flag, [4] = seq counter
+        seq = data[4]
+        length = data[5] | (data[6] << 8)
+        total_len = 7 + length + 1
+        if len(data) < total_len:
             _LOGGER.debug(
-                "Packet too short: expected %d, got %d",
-                7 + length + 1,
-                len(data),
+                "Packet too short: expected %d, got %d", total_len, len(data)
             )
             return None
         payload = data[7 : 7 + length]
         received_crc = data[7 + length]
-        if length > 0:
-            calc_crc = crc8(payload)
-            if calc_crc != received_crc:
-                _LOGGER.debug(
-                    "CRC mismatch: calc=0x%02X recv=0x%02X",
-                    calc_crc,
-                    received_crc,
-                )
-                return None
+        # CRC over bytes[0..N-2] (all bytes except the CRC byte)
+        calc_crc = crc8(data[: 7 + length])
+        if calc_crc != received_crc:
+            _LOGGER.debug(
+                "CRC mismatch: calc=0x%02X recv=0x%02X", calc_crc, received_crc
+            )
+            return None
         return cls(cmd, payload, seq)
 
 
 # ---------------------------------------------------------------------------
 # Response parsers
 # ---------------------------------------------------------------------------
-def parse_device_info(payload: bytes) -> DeviceInfo:
-    """Parse GET_INFO (CMD 0x00) response payload.
+def parse_device_info_v1(payload: bytes) -> DeviceInfo:
+    """Parse LP-BP2W GET_INFO (CMD 0x00) response payload.
 
-    The response is 40 bytes. Exact layout based on HCI snoop analysis.
+    The response is 40 bytes. This contains raw device registers including
+    timestamps, counters, and status bytes. The exact layout is not fully
+    documented but includes battery level.
+
+    From probe log (40 bytes):
+      10db11006ac21100 d4190000 c8004005 3a68cd03 6d67c800
+      01 01 00 d7530300 14000000 00000000 03
     """
     info = DeviceInfo()
     try:
-        if len(payload) >= 20:
-            info.hw_version = (
-                payload[0:6].decode("ascii", errors="replace").strip("\x00")
-            )
-            info.fw_version = (
-                payload[6:12].decode("ascii", errors="replace").strip("\x00")
-            )
-            info.serial_number = (
-                payload[12:20].decode("ascii", errors="replace").strip("\x00")
-            )
-        if len(payload) >= 22:
-            info.battery_level = payload[20]
-            info.battery_status = payload[21]
+        if len(payload) >= 40:
+            # Battery level appears to be around byte 24-25 based on
+            # the values changing between probe runs (c8=200 -> %, or
+            # the byte at offset 24 = 0x01 = charging status)
+            # For now extract what we can confirm
+            info.battery_level = payload[24]  # observed as 0x01 or status byte
+            info.battery_status = payload[25]
+        _LOGGER.debug(
+            "CMD 0x00 raw (40b): %s", payload.hex()
+        )
+    except Exception as e:
+        _LOGGER.warning("Failed to parse device info v1: %s", e)
+    return info
+
+
+def parse_device_info(payload: bytes) -> DeviceInfo:
+    """Parse standard GET_DEVICE_INFO (CMD 0xE1) response payload.
+
+    This is the preferred command — returns structured info including
+    model string, serial number, firmware version, etc.
+
+    Verified layout from probe log (60 bytes):
+      [0]     0x42  hardware version (66)
+      [1-2]   status/unknown
+      [3]     software version major
+      [4]     software version minor
+      [5-8]   unknown
+      [9-16]  model string (8 bytes ASCII): "32120011"
+      [17]    sub-version / build (0x05)
+      [18-19] padding
+      [20-23] unknown (CRC or ID)
+      [24-25] device clock year (uint16 LE) — NOT firmware build date
+      [26]    device clock month
+      [27]    device clock day
+      [28]    device clock hour
+      [29]    device clock minute
+      [30]    device clock second
+      [31-36] unknown/padding
+      [37]    serial number length (0x0A = 10)
+      [38-47] serial number ASCII: "2523C00812"
+      [48-59] padding (zeros)
+    """
+    info = DeviceInfo()
+    try:
+        if len(payload) < 17:
+            return info
+
+        info.hw_version = str(payload[0])
+
+        # Software version
+        sw_major = payload[3]
+        sw_minor = payload[4]
+        info.fw_version = f"{sw_major}.{sw_minor}"
+
+        # Model string: fixed 8 bytes at offset 9
+        info.model = (
+            payload[9:17]
+            .decode("ascii", errors="replace")
+            .strip("\x00")
+        )
+
+        # Bytes 24-30 contain the device's current clock (set by SYNC_TIME),
+        # NOT the firmware build date. We just use sw_major.sw_minor.
+        info.fw_version = f"{sw_major}.{sw_minor}"
+
+        # Serial number: length at byte 37, string at bytes 38+
+        if len(payload) >= 38:
+            sn_len = payload[37]
+            if 0 < sn_len <= 20 and 38 + sn_len <= len(payload):
+                info.serial_number = (
+                    payload[38 : 38 + sn_len]
+                    .decode("ascii", errors="replace")
+                    .strip("\x00")
+                )
+
+        _LOGGER.debug(
+            "Device info: hw=%s fw=%s model=%s sn=%s",
+            info.hw_version,
+            info.fw_version,
+            info.model,
+            info.serial_number,
+        )
     except Exception as e:
         _LOGGER.warning("Failed to parse device info: %s", e)
     return info
@@ -250,12 +389,20 @@ def parse_device_info(payload: bytes) -> DeviceInfo:
 def parse_rt_data(payload: bytes) -> RtData:
     """Parse real-time data (CMD 0x08) notification payload.
 
-    This is pushed by the device continuously while active.
-    Payload is 32 bytes. Layout from HCI snoop analysis:
-      byte 0: device_status (3=READY, 4=MEASURING, 5=MEASURE_END)
+    Based on Bp2BleInterface.kt and Bp2BleCmd.java:
+      byte 0: data type (0=BP measuring, 1=BP end, 2=ECG measuring, 3=ECG end)
       byte 1: battery_status
       byte 2: battery_level (percentage)
-      bytes 3+: varies by device_status
+      bytes 3+: varies by data type
+
+    For BP measuring (type 0):
+      bytes 3-4: cuff pressure (uint16 LE)
+
+    For BP end (type 1):
+      bytes 3-4: systolic (uint16 LE)
+      bytes 5-6: diastolic (uint16 LE)
+      bytes 7-8: mean arterial pressure (uint16 LE)
+      bytes 9-10: pulse (uint16 LE)
     """
     rt = RtData()
     try:
@@ -265,18 +412,21 @@ def parse_rt_data(payload: bytes) -> RtData:
             rt.battery_status = payload[1]
         if len(payload) >= 3:
             rt.battery_level = payload[2]
-        if len(payload) >= 5:
-            rt.cuff_pressure = struct.unpack_from("<H", payload, 3)[0]
-        # When device_status == STATUS_BP_MEASURE_END, the result follows
-        if rt.device_status == STATUS_BP_MEASURE_END and len(payload) >= 13:
-            rt.result_ready = True
-            rt.systolic = struct.unpack_from("<H", payload, 5)[0]
-            rt.diastolic = struct.unpack_from("<H", payload, 7)[0]
-            rt.mean_arterial_pressure = struct.unpack_from("<H", payload, 9)[0]
-            rt.pulse = struct.unpack_from("<H", payload, 11)[0]
-            rt.measuring = False
-        elif rt.device_status == STATUS_BP_MEASURING:
+
+        # Type 0: BP measuring — cuff pressure follows
+        if rt.device_status == 0 and len(payload) >= 5:
             rt.measuring = True
+            rt.cuff_pressure = struct.unpack_from("<H", payload, 3)[0]
+
+        # Type 1: BP measurement complete — results follow
+        elif rt.device_status == 1 and len(payload) >= 11:
+            rt.result_ready = True
+            rt.measuring = False
+            rt.systolic = struct.unpack_from("<H", payload, 3)[0]
+            rt.diastolic = struct.unpack_from("<H", payload, 5)[0]
+            rt.mean_arterial_pressure = struct.unpack_from("<H", payload, 7)[0]
+            rt.pulse = struct.unpack_from("<H", payload, 9)[0]
+
     except Exception as e:
         _LOGGER.warning(
             "Failed to parse rt data: %s (payload hex: %s)",
@@ -289,84 +439,84 @@ def parse_rt_data(payload: bytes) -> RtData:
 def parse_bp_file(payload: bytes) -> list[BpResult]:
     """Parse BP measurement data from the bp2nibp.list file.
 
-    The file format (from HCI snoop analysis) contains measurement records.
-    Each record contains BP readings with 2-byte LE fields for values that
-    can exceed 255 (systolic, diastolic, pulse, MAP), plus timestamp and flags.
+    File format (verified from device dump — LP-BP2W):
+      Header: 10 bytes (byte 0: version?, byte 1: user count?, rest zeros)
+      Records: 37 bytes each, starting at offset 10
 
-    Observed record structure in the file data:
-      - Records separated by padding/header bytes
-      - Each record: systolic(2) + diastolic(2) + pulse(2) + MAP(2) + flags + padding + timestamp(4)
+    Record layout (37 bytes):
+      [0-3]   timestamp (uint32 LE, unix seconds)
+      [4-7]   user_id (uint32 LE)
+      [8]     status_flag (0x00 or 0x01)
+      [9-12]  reserved (zeros)
+      [13-14] systolic (uint16 LE, mmHg)
+      [15-16] diastolic (uint16 LE, mmHg)
+      [17-18] pulse (uint16 LE, bpm)
+      [19-20] MAP (uint16 LE, mmHg)
+      [21-36] padding (zeros)
+
+    Records are stored in circular buffer order (not necessarily chronological).
     """
+    HEADER_SIZE = 10
+    RECORD_SIZE = 37
+
     results: list[BpResult] = []
     try:
-        if len(payload) < 8:
+        if len(payload) < HEADER_SIZE + RECORD_SIZE:
+            _LOGGER.debug(
+                "BP file too short: %d bytes (need at least %d)",
+                len(payload),
+                HEADER_SIZE + RECORD_SIZE,
+            )
             return results
 
         _LOGGER.debug(
-            "Parsing BP file: %d bytes, first 40 hex: %s",
+            "Parsing BP file: %d bytes, header: %s",
             len(payload),
-            payload[:40].hex(),
+            payload[:HEADER_SIZE].hex(),
         )
 
-        # The file starts with a small header, then contains records.
-        # From sniffing we see patterns like:
-        #   72003e004b004000 00000000 00000000 0000000000 66b40f69 d7530300 01 ...
-        #   sys=114 dia=62 pulse=75 MAP=64 ... timestamp ... flags
-        # Records appear to be ~40 bytes each based on file size vs record count.
-        # We scan for plausible BP readings (2-byte LE values in valid ranges).
+        record_data = payload[HEADER_SIZE:]
+        num_records = len(record_data) // RECORD_SIZE
 
-        # Strategy: scan the raw bytes for 4 consecutive uint16 LE values
-        # that look like BP readings (systolic: 60-250, diastolic: 30-150,
-        # pulse: 30-200, MAP: 30-200).
-        offset = 0
-        while offset + 8 <= len(payload):
-            sys_val = struct.unpack_from("<H", payload, offset)[0]
-            dia_val = struct.unpack_from("<H", payload, offset + 2)[0]
-            pulse_val = struct.unpack_from("<H", payload, offset + 4)[0]
-            map_val = struct.unpack_from("<H", payload, offset + 6)[0]
+        for i in range(num_records):
+            rec = record_data[i * RECORD_SIZE : (i + 1) * RECORD_SIZE]
+            if len(rec) < 21:
+                break
 
-            if (
-                60 <= sys_val <= 250
-                and 30 <= dia_val <= 150
-                and 30 <= pulse_val <= 200
-                and 30 <= map_val <= 200
-                and dia_val < sys_val
-            ):
-                # Look for a 4-byte unix timestamp nearby (within next 20 bytes)
-                ts = 0
-                for ts_off in range(offset + 8, min(offset + 28, len(payload) - 3)):
-                    candidate = struct.unpack_from("<I", payload, ts_off)[0]
-                    # Valid unix timestamp: between 2020 and 2040
-                    if 1577836800 <= candidate <= 2208988800:
-                        ts = candidate
-                        break
+            timestamp = struct.unpack_from("<I", rec, 0)[0]
+            # user_id = struct.unpack_from("<I", rec, 4)[0]
+            status_flag = rec[8]
+            systolic = struct.unpack_from("<H", rec, 13)[0]
+            diastolic = struct.unpack_from("<H", rec, 15)[0]
+            pulse = struct.unpack_from("<H", rec, 17)[0]
+            map_val = struct.unpack_from("<H", rec, 19)[0]
 
-                bp = BpResult(
-                    systolic=sys_val,
-                    diastolic=dia_val,
-                    pulse=pulse_val,
-                    mean_arterial_pressure=map_val,
-                    timestamp=ts,
-                )
-                # Calculate MAP if not provided
-                if bp.mean_arterial_pressure == 0 and bp.systolic > 0:
-                    bp.mean_arterial_pressure = (
-                        bp.diastolic + (bp.systolic - bp.diastolic) // 3
-                    )
-                results.append(bp)
-                _LOGGER.debug(
-                    "Found BP record at offset %d: %d/%d pulse=%d MAP=%d ts=%s",
-                    offset,
-                    sys_val,
-                    dia_val,
-                    pulse_val,
-                    map_val,
-                    bp.timestamp_str,
-                )
-                # Skip past this record to avoid duplicate detection
-                offset += 20
-            else:
-                offset += 2  # scan in 2-byte steps
+            # Skip obviously invalid records (empty slots)
+            if systolic == 0 or diastolic == 0 or pulse == 0:
+                continue
+
+            bp = BpResult(
+                systolic=systolic,
+                diastolic=diastolic,
+                pulse=pulse,
+                mean_arterial_pressure=map_val,
+                timestamp=timestamp,
+                irregular_heartbeat=(status_flag == 0),
+            )
+            results.append(bp)
+            _LOGGER.debug(
+                "BP record %d: %d/%d pulse=%d MAP=%d ts=%s flag=%d",
+                i,
+                systolic,
+                diastolic,
+                pulse,
+                map_val,
+                bp.timestamp_str,
+                status_flag,
+            )
+
+        _LOGGER.info("Parsed %d BP records from %d bytes", len(results), len(payload))
+
     except Exception as e:
         _LOGGER.warning(
             "Failed to parse BP file: %s (payload len: %d)", e, len(payload)
@@ -378,7 +528,6 @@ def parse_battery(payload: bytes) -> tuple[int, int]:
     """Parse GET_BATTERY (CMD 0x30) response.
 
     Returns (battery_level, battery_status).
-    From HCI snoop: 4-byte payload, byte 1 appears to be battery level.
     """
     level = 0
     status = 0
@@ -386,13 +535,6 @@ def parse_battery(payload: bytes) -> tuple[int, int]:
         if len(payload) >= 2:
             status = payload[0]
             level = payload[1]
-        if len(payload) >= 4:
-            _LOGGER.debug(
-                "Battery payload: %s (level=%d%% status=%d)",
-                payload.hex(),
-                level,
-                status,
-            )
     except Exception as e:
         _LOGGER.warning("Failed to parse battery: %s", e)
     return level, status
@@ -401,57 +543,70 @@ def parse_battery(payload: bytes) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 # Command builders (Protocol V2)
 # ---------------------------------------------------------------------------
-_seq_counter = count(0)
+_seq_counter = count(1)
 
 
 def _next_seq() -> int:
-    """Return the next sequence number.
-
-    Format: byte3 = 0x00 (TX flag), byte4 = counter.
-    As a LE uint16: counter << 8.
-    """
-    counter = next(_seq_counter) & 0xFF
-    return counter << 8  # SeqHi = counter, SeqLo = 0x00 (TX)
+    """Return the next sequence number (0-254, wrapping)."""
+    return next(_seq_counter) % 255
 
 
 def build_sync_time() -> bytes:
-    """Build SYNC_TIME command (CMD 0xC0).
+    """Build SYNC_TIME command (CMD 0xEC).
 
-    Payload: year(2 LE) + month(1) + day(1) + hour(1) + min(1) + sec(1) + extra(1)
+    Payload: year(2 LE) + month(1) + day(1) + hour(1) + min(1) + sec(1)
     """
     now = time.localtime()
     payload = struct.pack(
-        "<HBBBBBB",
+        "<HBBBBB",
         now.tm_year,
         now.tm_mon,
         now.tm_mday,
         now.tm_hour,
         now.tm_min,
         now.tm_sec,
-        0x14,  # observed constant in sniff (possibly timezone or weekday)
     )
-    # Sync time uses a special seq with counter=0xFE
-    return LepuPacket(cmd=CMD_SYNC_TIME, payload=payload, seq=0xFE00).encode()
+    return LepuPacket(cmd=CMD_SYNC_TIME, payload=payload, seq=_next_seq()).encode()
 
 
 def build_get_info() -> bytes:
-    """Build GET_INFO command (CMD 0x00)."""
+    """Build LP-BP2W GET_INFO command (CMD 0x00).
+
+    Returns 40-byte device info with raw registers.
+    """
     return LepuPacket(cmd=CMD_GET_INFO, seq=_next_seq()).encode()
 
 
 def build_get_device_info() -> bytes:
-    """Build GET_DEVICE_INFO command (CMD 0xE1)."""
+    """Build standard GET_DEVICE_INFO command (CMD 0xE1).
+
+    Returns 60-byte structured info with model, serial, firmware.
+    This is the preferred info command.
+    """
     return LepuPacket(cmd=CMD_GET_DEVICE_INFO, seq=_next_seq()).encode()
 
 
 def build_get_config() -> bytes:
-    """Build GET_CONFIG command (CMD 0x33)."""
+    """Build GET_CONFIG command (CMD 0x06)."""
     return LepuPacket(cmd=CMD_GET_CONFIG, seq=_next_seq()).encode()
 
 
 def build_get_battery() -> bytes:
     """Build GET_BATTERY command (CMD 0x30)."""
     return LepuPacket(cmd=CMD_GET_BATTERY, seq=_next_seq()).encode()
+
+
+def build_echo() -> bytes:
+    """Build ECHO/ping command (CMD 0x0A). Returns empty ACK."""
+    return LepuPacket(cmd=CMD_ECHO, seq=_next_seq()).encode()
+
+
+def build_read_file_list() -> bytes:
+    """Build READ_FILE_LIST command (CMD 0xF1).
+
+    Returns the list of files stored on the device.
+    """
+    return LepuPacket(cmd=CMD_READ_FILE_LIST, seq=_next_seq()).encode()
 
 
 def build_read_file_start(filename: str) -> bytes:
@@ -527,7 +682,7 @@ class PacketReassembler:
                 self._buffer = self._buffer[1:]
                 continue
 
-            length = struct.unpack_from("<H", self._buffer, 5)[0]
+            length = self._buffer[5] | (self._buffer[6] << 8)
             total_len = 7 + length + 1  # header(7) + payload + crc(1)
 
             # Sanity: reject absurdly large packets

@@ -32,14 +32,17 @@ from .const import (
 )
 from .protocol import (
     CMD_GET_INFO,
+    CMD_GET_DEVICE_INFO,
     CMD_RT_DATA,
     CMD_GET_BATTERY,
     CMD_GET_CONFIG,
     CMD_SYNC_TIME,
-    CMD_GET_DEVICE_INFO,
+    CMD_ECHO,
+    CMD_READ_FILE_LIST,
     CMD_READ_FILE_START,
     CMD_READ_FILE_DATA,
     CMD_READ_FILE_END,
+    CMD_GET_LP_CONFIG,
     FILE_BP_LIST,
     BpResult,
     DeviceInfo,
@@ -51,10 +54,12 @@ from .protocol import (
     build_sync_time,
     build_get_config,
     build_get_battery,
+    build_echo,
     build_read_file_start,
     build_read_file_data,
     build_read_file_end,
     parse_device_info,
+    parse_device_info_v1,
     parse_rt_data,
     parse_bp_file,
     parse_battery,
@@ -67,11 +72,6 @@ MAX_STORED_MEASUREMENTS = 50
 
 # Maximum BLE connection retries
 MAX_CONNECT_RETRIES = 3
-
-# Alternative BLE characteristic UUID (8ec9XXXX service)
-# The LP-BP2W uses 8ec90001 as a transport layer: commands are written here
-# and ACKs come back, while actual protocol responses arrive on NOTIFY_UUID.
-ALT_NOTIFY_UUID = "8ec90001-f315-4f60-9fb8-838830daea50"
 
 
 class ViatomBP2Data:
@@ -169,9 +169,8 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         self._all_files_done.set()
         self._current_client: BleakClient | None = None
         self._last_disconnect: float = 0  # monotonic timestamp
-        self._notification_received = asyncio.Event()
-        # Active write UUID — set during connect to transport layer char
-        self._active_write_uuid: str = WRITE_UUID
+        self._cmd_response = asyncio.Event()
+        self._measuring = False  # True if device is actively taking a measurement
 
     @property
     def bp_data(self) -> ViatomBP2Data:
@@ -242,20 +241,13 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 for char in service.characteristics:
                     props = ",".join(char.properties)
                     _LOGGER.debug(
-                        "  Char %s [%s] props=%s descriptors=%d",
+                        "  Char %s [%s] props=%s",
                         char.uuid,
                         char.handle,
                         props,
-                        len(char.descriptors),
                     )
 
-            # === Dual-subscribe approach ===
-            # The LP-BP2W uses a two-layer architecture:
-            #   - Transport layer on 8ec90001 (write commands here, get ACKs)
-            #   - Application layer on 0734594a (protocol responses arrive here)
-            # We subscribe to BOTH and write through 8ec90001.
-
-            # Subscribe to Lepu application layer (actual protocol responses)
+            # Subscribe to Lepu notify characteristic (protocol responses)
             try:
                 await client.start_notify(
                     NOTIFY_UUID, self._notification_handler
@@ -269,32 +261,13 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                     NOTIFY_UUID[:12],
                     e,
                 )
+                # If we can't subscribe to notifications, we can't communicate
+                return
 
-            # Subscribe to transport layer (ACKs, may also carry data)
-            try:
-                await client.start_notify(
-                    ALT_NOTIFY_UUID, self._transport_handler
-                )
-                _LOGGER.info(
-                    "Subscribed to transport char %s", ALT_NOTIFY_UUID[:12]
-                )
-            except BleakError as e:
-                _LOGGER.warning(
-                    "Failed to subscribe to transport %s: %s",
-                    ALT_NOTIFY_UUID[:12],
-                    e,
-                )
+            # Give CCCD write time to propagate through ESPHome proxy
+            await asyncio.sleep(0.5)
 
-            # Give CCCD writes time to propagate through ESPHome proxy
-            await asyncio.sleep(1.5)
-
-            # Use 8ec90001 as the write characteristic
-            self._active_write_uuid = ALT_NOTIFY_UUID
-            _LOGGER.info(
-                "Using write char: %s (transport layer)", ALT_NOTIFY_UUID[:12]
-            )
-
-            # === Run Protocol V2 init sequence ===
+            # === Run production init sequence ===
             await self._run_init_sequence(client)
 
         except BleakError as e:
@@ -309,144 +282,136 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             self.async_set_updated_data(self._data)
 
     async def _run_init_sequence(self, client: BleakClient) -> None:
-        """Diagnostic round 2: deeper probing of the 8ec9 service and
-        write char lookup, plus longer waits for delayed responses."""
-        cmd = build_sync_time()
-        _LOGGER.info("=== DIAGNOSTIC R2: deeper probing ===")
+        """Production init sequence: GET_INFO → SYNC_TIME → fetch stored BP data.
 
-        # --- Characteristic index diagnostic ---
-        _LOGGER.info("--- Char index check ---")
-        for service in client.services:
-            for char in service.characteristics:
-                found = client.services.get_characteristic(char.uuid)
-                if found is None:
-                    _LOGGER.warning(
-                        "CHAR INDEX BUG: %s (handle %s) exists in services "
-                        "but get_characteristic returns None!",
-                        char.uuid, char.handle,
-                    )
-                    # Try by handle as fallback
-                    found_h = client.services.get_characteristic(char.handle)
-                    _LOGGER.info(
-                        "  get_characteristic(handle=%s) → %s",
-                        char.handle,
-                        found_h is not None,
-                    )
+        Protocol verified working via direct BLE probe with CRC-8/CCITT.
+        Commands are written to WRITE_UUID (8b00ace7) with write-with-response.
+        Responses arrive on NOTIFY_UUID (0734594a).
 
-        # --- Strategy E: write to 8ec90001, wait 10s for delayed responses ---
-        _LOGGER.info("--- Strategy E: write 8ec90001, long wait (10s) ---")
-        self._notification_received.clear()
-        try:
-            await client.write_gatt_char(ALT_NOTIFY_UUID, cmd, response=True)
-            _LOGGER.info("Strategy E: wrote to 8ec90001: %s", cmd.hex())
-        except BleakError as e:
-            _LOGGER.warning("Strategy E: write failed: %s", e)
-        # Wait 10 seconds, logging everything that arrives
-        try:
-            await asyncio.wait_for(
-                self._notification_received.wait(), timeout=10.0
-            )
-            _LOGGER.info("Strategy E: got Lepu-side notification!")
-        except TimeoutError:
-            _LOGGER.info("Strategy E: no Lepu notification after 10s")
+        IMPORTANT: If the device is actively measuring BP, we do NOT send
+        file download commands (which would kill the measurement). Instead
+        we just wait for the real-time result to arrive.
+        """
+        _LOGGER.info("=== Starting BP2 init sequence ===")
 
+        # Step 1: Echo/ping to verify communication
+        _LOGGER.debug("Step 1: Echo/ping")
+        await self._send_and_wait(client, build_echo(), timeout=3.0)
+
+        # Step 2: Get device info (standard CMD 0xE1 — structured response)
+        _LOGGER.debug("Step 2: GET_DEVICE_INFO (0xE1)")
+        await self._send_and_wait(client, build_get_device_info(), timeout=3.0)
+
+        # Step 3: Get LP-BP2W info (CMD 0x00 — raw registers)
+        _LOGGER.debug("Step 3: GET_INFO (0x00)")
+        await self._send_and_wait(client, build_get_info(), timeout=3.0)
+
+        # Step 4: Sync time
+        _LOGGER.debug("Step 4: SYNC_TIME")
+        await self._send_and_wait(client, build_sync_time(), timeout=3.0)
+
+        # Step 5: Get battery
+        _LOGGER.debug("Step 5: GET_BATTERY")
+        await self._send_and_wait(client, build_get_battery(), timeout=3.0)
+
+        # Step 6: Check if the device is actively measuring.
+        # After the info/battery commands, the device may have pushed
+        # RT data (CMD 0x08) if a measurement is in progress. The
+        # _notification_handler sets self._measuring when it sees
+        # RT data with device_status == 0 (BP measuring).
+        #
+        # Also wait a moment for any queued RT notifications to arrive.
         await asyncio.sleep(0.5)
 
-        # --- Strategy F: write to 8ec90002 (w-o-r) ---
-        _LOGGER.info("--- Strategy F: write to 8ec90002 (write-without-response) ---")
-        alt_write = "8ec90002-f315-4f60-9fb8-838830daea50"
-        self._notification_received.clear()
-        try:
-            await client.write_gatt_char(alt_write, cmd, response=False)
-            _LOGGER.info("Strategy F: wrote to 8ec90002: %s", cmd.hex())
-        except BleakError as e:
-            _LOGGER.warning("Strategy F: write to 8ec90002 failed: %s", e)
-
-        try:
-            await asyncio.wait_for(
-                self._notification_received.wait(), timeout=5.0
+        if self._measuring:
+            # Device is actively measuring — do NOT send file commands.
+            # Wait for the measurement to complete (typically 30-60s).
+            _LOGGER.info(
+                "Device is measuring BP — waiting for result "
+                "(not downloading files to avoid interruption)"
             )
-            _LOGGER.info("Strategy F: got notification!")
-        except TimeoutError:
-            _LOGGER.info("Strategy F: no notification after 5s")
-
-        await asyncio.sleep(0.5)
-
-        # --- Strategy G: write to 8b00ace7 by handle (bypass index bug) ---
-        _LOGGER.info("--- Strategy G: write to 8b00ace7 by handle 16 ---")
-        self._notification_received.clear()
-        try:
-            await client.write_gatt_char(16, cmd, response=False)
-            _LOGGER.info("Strategy G: wrote to handle 16 (w-o-r): %s", cmd.hex())
-        except (BleakError, Exception) as e:
-            _LOGGER.warning("Strategy G: write-no-resp failed: %s", e)
-        try:
-            await asyncio.wait_for(
-                self._notification_received.wait(), timeout=3.0
-            )
-            _LOGGER.info("Strategy G: got notification!")
-        except TimeoutError:
-            _LOGGER.info("Strategy G: no notification after 3s")
-
-        await asyncio.sleep(0.5)
-
-        # --- Strategy H: varied payloads to 8ec90001 ---
-        # See if the 60 a5 02 response changes with different data
-        _LOGGER.info("--- Strategy H: varied payloads to 8ec90001 ---")
-        test_payloads = [
-            ("single_a5", bytes([0xA5])),
-            ("four_zeros", bytes([0x00, 0x00, 0x00, 0x00])),
-            ("ping_01", bytes([0x01])),
-            ("lepu_v1_hello", bytes([0xAA, 0x17, 0xE8, 0x00, 0x00])),
-        ]
-        for label, payload in test_payloads:
             try:
-                await client.write_gatt_char(
-                    ALT_NOTIFY_UUID, payload, response=True
+                await asyncio.wait_for(
+                    self._got_result.wait(), timeout=90.0
+                )
+                _LOGGER.info("Got measurement result while device was active")
+            except TimeoutError:
+                _LOGGER.warning(
+                    "Measurement did not complete within 90s"
+                )
+        else:
+            # Device is idle — safe to download stored measurements.
+            _LOGGER.info("Step 6: Fetching stored BP measurements")
+            self._all_files_done.clear()
+            await self._write_command(
+                client, build_read_file_start(FILE_BP_LIST)
+            )
+
+            # Wait for file download to complete (or timeout)
+            try:
+                await asyncio.wait_for(
+                    self._all_files_done.wait(), timeout=30.0
                 )
                 _LOGGER.info(
-                    "Strategy H [%s]: wrote %s", label, payload.hex()
+                    "File download complete, %d measurements loaded",
+                    len(self._data.measurements),
                 )
-            except BleakError as e:
-                _LOGGER.warning(
-                    "Strategy H [%s]: write failed: %s", label, e
-                )
-            await asyncio.sleep(1.5)
+            except TimeoutError:
+                _LOGGER.warning("File download timed out after 30s")
 
-        _LOGGER.info("=== DIAGNOSTIC R2 COMPLETE ===")
+        _LOGGER.info("=== BP2 init sequence complete ===")
+
+    async def _send_and_wait(
+        self, client: BleakClient, data: bytes, timeout: float = 3.0
+    ) -> bool:
+        """Send a command and wait for a response notification."""
+        self._cmd_response.clear()
+        await self._write_command(client, data)
+        try:
+            await asyncio.wait_for(
+                self._cmd_response.wait(), timeout=timeout
+            )
+            return True
+        except TimeoutError:
+            _LOGGER.debug(
+                "No response for command %s within %.1fs",
+                data[:8].hex() if len(data) >= 8 else data.hex(),
+                timeout,
+            )
+            return False
 
     async def _write_command(self, client: BleakClient, data: bytes) -> None:
-        """Write a command to the active write characteristic.
+        """Write a command to the Lepu write characteristic.
 
-        IMPORTANT: Protocol V2 requires write-without-response (WRITE_CMD).
-        Using WRITE_REQ (response=True) causes the device to silently
-        ignore all commands on the Lepu service. For other services,
-        we auto-detect from characteristic properties.
+        Uses write-with-response (WRITE_REQ) — proven working in BLE probe.
+        The LP-BP2W's 8b00ace7 char supports both write and write-without-response.
         """
         if client.is_connected:
             try:
-                write_char = client.services.get_characteristic(
-                    self._active_write_uuid
-                )
-                use_response = (
-                    write_char is not None
-                    and "write-without-response" not in write_char.properties
-                )
-                await client.write_gatt_char(
-                    self._active_write_uuid, data, response=use_response
-                )
+                await client.write_gatt_char(WRITE_UUID, data, response=True)
                 _LOGGER.debug(
                     "Sent command on %s: %s",
-                    self._active_write_uuid[:12],
+                    WRITE_UUID[:12],
                     data.hex(),
                 )
-            except BleakError as e:
-                _LOGGER.warning("Failed to write command: %s", e)
+            except BleakError:
+                # Fall back to write-without-response
+                try:
+                    await client.write_gatt_char(
+                        WRITE_UUID, data, response=False
+                    )
+                    _LOGGER.debug(
+                        "Sent command (no-resp) on %s: %s",
+                        WRITE_UUID[:12],
+                        data.hex(),
+                    )
+                except BleakError as e:
+                    _LOGGER.warning("Failed to write command: %s", e)
 
     def _notification_handler(
         self, _sender: Any, data: bytearray
     ) -> None:
-        """Handle raw BLE notification data.
+        """Handle raw BLE notification data from the Lepu notify char.
 
         This callback may be invoked from a background thread (direct BT
         adapters) or from the event loop (ESPHome proxies). We schedule
@@ -456,72 +421,51 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         _LOGGER.debug(
             "BLE notification (%d bytes): %s", len(raw), raw.hex()
         )
-        # Signal that we received at least one notification (for probing)
-        self._notification_received.set()
-        self.hass.loop.call_soon_threadsafe(self._reassembler.feed, raw)
-
-    def _transport_handler(
-        self, _sender: Any, data: bytearray
-    ) -> None:
-        """Handle notifications from the transport layer (8ec90001).
-
-        The LP-BP2W sends short ACK frames (e.g. 60 a5 02) on this
-        characteristic for every command written.  These are NOT Lepu
-        protocol packets — just transport-level acknowledgements.  We
-        log them for diagnostics and also forward the raw bytes to the
-        reassembler in case the device ever sends full protocol frames
-        on this channel.
-        """
-        raw = bytes(data)
-        _LOGGER.debug(
-            "Transport notification (%d bytes): %s", len(raw), raw.hex()
-        )
-        # Short frames (≤4 bytes) are ACKs — log and skip
-        if len(raw) <= 4:
-            _LOGGER.debug("Transport ACK: %s", raw.hex())
-            return
-        # Longer frames may carry protocol data — feed to reassembler
-        _LOGGER.info(
-            "Transport layer sent %d-byte frame, feeding to reassembler",
-            len(raw),
-        )
+        # Signal that we received a response
+        self._cmd_response.set()
         self.hass.loop.call_soon_threadsafe(self._reassembler.feed, raw)
 
     def _handle_packet(self, packet: LepuPacket) -> None:
         """Handle a decoded Lepu protocol V2 packet."""
         _LOGGER.debug(
-            "Packet: cmd=0x%02X seq=0x%04X payload_len=%d",
+            "Packet: cmd=0x%02X seq=%d payload_len=%d",
             packet.cmd,
             packet.seq,
             len(packet.payload),
         )
 
-        # Sync time ACK (CMD 0xC0)
+        # Sync time ACK (CMD 0xEC)
         if packet.cmd == CMD_SYNC_TIME:
             _LOGGER.info("Time sync acknowledged")
 
-        # Device info response (CMD 0x00)
+        # LP-BP2W device info (CMD 0x00) — raw 40-byte response
         elif packet.cmd == CMD_GET_INFO:
-            info = parse_device_info(packet.payload)
-            self._data.device_info = info
-            if info.battery_level > 0:
+            info = parse_device_info_v1(packet.payload)
+            # Only update battery from this if we don't have it yet
+            if info.battery_level > 0 and self._data.battery_level is None:
                 self._data.battery_level = info.battery_level
             _LOGGER.info(
-                "Device info: hw=%s fw=%s sn=%s battery=%d%%",
+                "LP-BP2W info (CMD 0x00): %d bytes", len(packet.payload)
+            )
+
+        # Standard device info (CMD 0xE1) — structured 60-byte response
+        elif packet.cmd == CMD_GET_DEVICE_INFO:
+            info = parse_device_info(packet.payload)
+            self._data.device_info = info
+            _LOGGER.info(
+                "Device info: hw=%s fw=%s model=%s sn=%s",
                 info.hw_version,
                 info.fw_version,
+                info.model,
                 info.serial_number,
-                info.battery_level,
             )
 
-        # Extended device info (CMD 0xE1)
-        elif packet.cmd == CMD_GET_DEVICE_INFO:
-            _LOGGER.info(
-                "Extended device info: %d bytes", len(packet.payload)
-            )
+        # Echo ACK (CMD 0x0A) — empty response confirms communication
+        elif packet.cmd == CMD_ECHO:
+            _LOGGER.info("Echo/ping acknowledged — communication verified")
 
-        # Config response (CMD 0x33)
-        elif packet.cmd == CMD_GET_CONFIG:
+        # Config response (CMD 0x06 or CMD 0x33)
+        elif packet.cmd in (CMD_GET_CONFIG, CMD_GET_LP_CONFIG):
             _LOGGER.debug("Config: %s", packet.payload.hex())
 
         # Battery response (CMD 0x30)
@@ -532,13 +476,21 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 self._data.battery_status = status
             _LOGGER.info("Battery: %d%% (status=%d)", level, status)
 
-        # Real-time data (CMD 0x08) — pushed by device
+        # Real-time data (CMD 0x08) — pushed by device during measurement
         elif packet.cmd == CMD_RT_DATA:
             rt = parse_rt_data(packet.payload)
             self._data.battery_level = rt.battery_level
             self._data.device_status = rt.device_status
+
+            if rt.measuring:
+                self._measuring = True
+                _LOGGER.debug(
+                    "Measuring... cuff pressure: %d", rt.cuff_pressure
+                )
+
             new_result = self._data.update_from_rt(rt)
             if new_result:
+                self._measuring = False  # measurement done
                 _LOGGER.info(
                     "BP Result: %d/%d mmHg, pulse %d bpm",
                     self._data.systolic,
@@ -546,10 +498,6 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                     self._data.pulse,
                 )
                 self._got_result.set()
-            elif rt.measuring:
-                _LOGGER.debug(
-                    "Measuring... cuff pressure: %d", rt.cuff_pressure
-                )
 
         # File start response (CMD 0xF2) — returns file size
         elif packet.cmd == CMD_READ_FILE_START:
@@ -568,6 +516,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                         name=f"viatom_bp2_file_{self.address}",
                     )
                 else:
+                    _LOGGER.info("File is empty (0 bytes)")
                     self._all_files_done.set()
             else:
                 _LOGGER.warning(
@@ -607,25 +556,31 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             # Parse the accumulated file data
             if self._file_data_buffer:
                 results = parse_bp_file(bytes(self._file_data_buffer))
-                for r in results:
-                    self._data.update_from_bp_result(r)
-                    _LOGGER.info(
-                        "Stored BP: %d/%d mmHg, pulse %d @ %s",
-                        r.systolic,
-                        r.diastolic,
-                        r.pulse,
-                        r.timestamp_str,
-                    )
-                self._file_data_buffer.clear()
+                _LOGGER.info("Parsed %d BP records from file", len(results))
                 if results:
+                    # Store all measurements
+                    self._data.measurements = results[
+                        -MAX_STORED_MEASUREMENTS:
+                    ]
+                    # Set "current" to the most recent by timestamp
+                    newest = max(results, key=lambda r: r.timestamp)
+                    self._data.update_from_bp_result(newest)
+                    _LOGGER.info(
+                        "Latest BP: %d/%d mmHg, pulse %d @ %s",
+                        newest.systolic,
+                        newest.diastolic,
+                        newest.pulse,
+                        newest.timestamp_str,
+                    )
                     self._got_result.set()
+                self._file_data_buffer.clear()
             self._all_files_done.set()
 
         else:
             _LOGGER.debug(
                 "Unhandled packet cmd=0x%02X payload=%s",
                 packet.cmd,
-                packet.payload.hex(),
+                packet.payload.hex() if packet.payload else "(empty)",
             )
 
     async def _request_file_chunk(self, offset: int) -> None:
@@ -646,12 +601,10 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         """Disconnect from the BP2."""
         try:
             if client.is_connected:
-                # Stop notifications on both subscribed characteristics
-                for uuid in (NOTIFY_UUID, ALT_NOTIFY_UUID):
-                    try:
-                        await client.stop_notify(uuid)
-                    except BleakError:
-                        pass
+                try:
+                    await client.stop_notify(NOTIFY_UUID)
+                except BleakError:
+                    pass
                 await client.disconnect()
         except BleakError:
             pass
