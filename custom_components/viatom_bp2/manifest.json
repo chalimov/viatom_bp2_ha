@@ -17,6 +17,10 @@
     {
       "local_name": "BP2A*",
       "connectable": true
+    },
+    {
+      "local_name": "LP-BP2*",
+      "connectable": true
     }
   ],
   "integration_type": "device",
