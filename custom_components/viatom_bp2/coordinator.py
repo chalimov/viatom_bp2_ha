@@ -309,55 +309,121 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             self.async_set_updated_data(self._data)
 
     async def _run_init_sequence(self, client: BleakClient) -> None:
-        """Run the full Protocol V2 init sequence."""
-        _LOGGER.debug("Sending full init sequence...")
+        """Diagnostic init: try multiple write strategies to find one that
+        produces actual protocol responses (not just transport ACKs)."""
+        cmd = build_sync_time()
+        _LOGGER.info("=== DIAGNOSTIC: testing write strategies with sync_time ===")
 
-        # 1. Sync time
-        await self._write_command(client, build_sync_time())
-        await asyncio.sleep(0.5)
+        # Readable characteristics we can poll after each write
+        read_uuids = [
+            ("0734594a-a8e7-4b1a-a6b1-cd5243059a57", "Lepu notify"),
+            ("8ec90002-f315-4f60-9fb8-838830daea50", "Alt 8ec9-0002"),
+            ("8b00ace7-eb0b-49b0-bbe9-9aee0a26e1a3", "Lepu write"),
+        ]
 
-        # 2. Get device info
-        _LOGGER.debug("Requesting device info (CMD 0x00)...")
-        await self._write_command(client, build_get_info())
-        await asyncio.sleep(0.5)
-
-        # 3. Get extended device info
-        _LOGGER.debug("Requesting extended device info (CMD 0xE1)...")
-        await self._write_command(client, build_get_device_info())
-        await asyncio.sleep(0.5)
-
-        # 4. Get config
-        _LOGGER.debug("Requesting config (CMD 0x33)...")
-        await self._write_command(client, build_get_config())
-        await asyncio.sleep(0.5)
-
-        # 5. Get battery
-        _LOGGER.debug("Requesting battery (CMD 0x30)...")
-        await self._write_command(client, build_get_battery())
-        await asyncio.sleep(0.5)
-
-        # 6. Read BP measurement file
-        _LOGGER.debug("Requesting BP file (bp2nibp.list)...")
-        self._all_files_done.clear()
-        await self._write_command(
-            client, build_read_file_start(FILE_BP_LIST)
-        )
-
-        # Wait for data
+        # --- Strategy A: write to 8ec90001 (transport), then READ responses ---
+        _LOGGER.info("--- Strategy A: write 8ec90001, read back from chars ---")
         try:
-            await asyncio.wait_for(self._got_result.wait(), timeout=30)
-            _LOGGER.info("Got measurement data from BP2")
-        except TimeoutError:
-            _LOGGER.debug(
-                "Timeout waiting for measurement result — "
-                "device may be idle or protocol needs tuning"
-            )
+            await client.write_gatt_char(ALT_NOTIFY_UUID, cmd, response=True)
+            _LOGGER.info("Strategy A: wrote to 8ec90001: %s", cmd.hex())
+        except BleakError as e:
+            _LOGGER.warning("Strategy A: write failed: %s", e)
+        await asyncio.sleep(1.0)
 
-        # Wait for file reads to complete
-        try:
-            await asyncio.wait_for(self._all_files_done.wait(), timeout=30)
-        except TimeoutError:
-            _LOGGER.warning("Timeout waiting for file reads to complete")
+        for uuid, label in read_uuids:
+            char = client.services.get_characteristic(uuid)
+            if char and "read" in char.properties:
+                try:
+                    data = await client.read_gatt_char(uuid)
+                    _LOGGER.info(
+                        "Strategy A: READ %s (%s) → %d bytes: %s",
+                        label, uuid[:12], len(data), data.hex(),
+                    )
+                except BleakError as e:
+                    _LOGGER.info("Strategy A: READ %s failed: %s", label, e)
+
+        await asyncio.sleep(0.5)
+
+        # --- Strategy B: write directly to 0734594a (bidirectional char) ---
+        _LOGGER.info("--- Strategy B: write directly to 0734594a ---")
+        self._notification_received.clear()
+        notify_char = client.services.get_characteristic(NOTIFY_UUID)
+        if notify_char and "write" in notify_char.properties:
+            use_resp = "write-without-response" not in notify_char.properties
+            try:
+                await client.write_gatt_char(
+                    NOTIFY_UUID, cmd, response=use_resp
+                )
+                _LOGGER.info(
+                    "Strategy B: wrote to 0734594a (response=%s): %s",
+                    use_resp, cmd.hex(),
+                )
+            except BleakError as e:
+                _LOGGER.warning("Strategy B: write failed: %s", e)
+
+            # Wait for notification on 0734594a
+            try:
+                await asyncio.wait_for(
+                    self._notification_received.wait(), timeout=3.0
+                )
+                _LOGGER.info("Strategy B: GOT notification on 0734594a!")
+            except TimeoutError:
+                _LOGGER.info("Strategy B: no notification after 3s")
+        else:
+            _LOGGER.info("Strategy B: 0734594a not writable, skipping")
+
+        await asyncio.sleep(0.5)
+
+        # --- Strategy C: write to 8b00ace7 with response=True ---
+        _LOGGER.info("--- Strategy C: write to 8b00ace7 response=True ---")
+        self._notification_received.clear()
+        write_char = client.services.get_characteristic(WRITE_UUID)
+        if write_char:
+            try:
+                await client.write_gatt_char(
+                    WRITE_UUID, cmd, response=True
+                )
+                _LOGGER.info(
+                    "Strategy C: wrote to 8b00ace7 (response=True): %s",
+                    cmd.hex(),
+                )
+            except BleakError as e:
+                _LOGGER.warning("Strategy C: write failed: %s", e)
+
+            try:
+                await asyncio.wait_for(
+                    self._notification_received.wait(), timeout=3.0
+                )
+                _LOGGER.info("Strategy C: GOT notification!")
+            except TimeoutError:
+                _LOGGER.info("Strategy C: no notification after 3s")
+
+        await asyncio.sleep(0.5)
+
+        # --- Strategy D: write to 8b00ace7 with response=False (original) ---
+        _LOGGER.info("--- Strategy D: write to 8b00ace7 response=False ---")
+        self._notification_received.clear()
+        if write_char:
+            try:
+                await client.write_gatt_char(
+                    WRITE_UUID, cmd, response=False
+                )
+                _LOGGER.info(
+                    "Strategy D: wrote to 8b00ace7 (response=False): %s",
+                    cmd.hex(),
+                )
+            except BleakError as e:
+                _LOGGER.warning("Strategy D: write failed: %s", e)
+
+            try:
+                await asyncio.wait_for(
+                    self._notification_received.wait(), timeout=3.0
+                )
+                _LOGGER.info("Strategy D: GOT notification!")
+            except TimeoutError:
+                _LOGGER.info("Strategy D: no notification after 3s")
+
+        _LOGGER.info("=== DIAGNOSTIC COMPLETE ===")
 
     async def _write_command(self, client: BleakClient, data: bytes) -> None:
         """Write a command to the active write characteristic.
