@@ -29,22 +29,6 @@ BATTERY_CHARGING = 1
 BATTERY_CHARGE_COMPLETE = 2
 BATTERY_LOW = 3
 
-# Lepu protocol constants
-PACKET_HEADER = 0xA5
-PACKET_TAIL = 0x5A  # Not all Lepu variants use tail
-
-# Command types (reverse-engineered from LepuBle SDK)
-CMD_GET_INFO = 0x14
-CMD_SYNC_TIME = 0x0C
-CMD_GET_FILE_LIST = 0x18
-CMD_READ_FILE_START = 0x1A
-CMD_READ_FILE_DATA = 0x1C
-CMD_READ_FILE_END = 0x1E
-CMD_RT_DATA = 0x16
-CMD_GET_CONFIG = 0x20
-CMD_SET_CONFIG = 0x22
-CMD_FACTORY_RESET = 0x24
-
 # Timeouts
 CONNECT_TIMEOUT = 15  # seconds
 DATA_TIMEOUT = 10  # seconds

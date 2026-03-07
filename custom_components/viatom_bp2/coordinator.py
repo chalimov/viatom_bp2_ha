@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 import logging
+import struct
 import time
 from typing import Any
 
@@ -30,19 +31,33 @@ from .const import (
     NOTIFY_UUID,
 )
 from .protocol import (
+    CMD_GET_INFO,
+    CMD_RT_DATA,
+    CMD_GET_BATTERY,
+    CMD_GET_CONFIG,
+    CMD_SYNC_TIME,
+    CMD_GET_DEVICE_INFO,
+    CMD_READ_FILE_START,
+    CMD_READ_FILE_DATA,
+    CMD_READ_FILE_END,
+    FILE_BP_LIST,
     BpResult,
     DeviceInfo,
     RtData,
     PacketReassembler,
     LepuPacket,
     build_get_info,
+    build_get_device_info,
     build_sync_time,
-    build_get_file_list,
+    build_get_config,
+    build_get_battery,
     build_read_file_start,
+    build_read_file_data,
+    build_read_file_end,
     parse_device_info,
     parse_rt_data,
     parse_bp_file,
-    parse_file_list,
+    parse_battery,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -83,7 +98,7 @@ class ViatomBP2Data:
             self.pulse = rt.pulse
             self.mean_arterial_pressure = rt.mean_arterial_pressure
             now = dt_util.now()
-            self.measurement_time = now  # datetime with tzinfo for TIMESTAMP device class
+            self.measurement_time = now
             self.last_update = time.monotonic()
             result = BpResult(
                 systolic=rt.systolic,
@@ -93,7 +108,6 @@ class ViatomBP2Data:
                 timestamp=int(now.timestamp()),
             )
             self.measurements.append(result)
-            # Limit stored measurements to avoid unbounded memory growth
             if len(self.measurements) > MAX_STORED_MEASUREMENTS:
                 self.measurements = self.measurements[-MAX_STORED_MEASUREMENTS:]
             return True
@@ -106,7 +120,6 @@ class ViatomBP2Data:
         self.pulse = result.pulse
         self.mean_arterial_pressure = result.mean_arterial_pressure
         self.irregular_heartbeat = result.irregular_heartbeat
-        # Convert unix timestamp to timezone-aware datetime for TIMESTAMP sensor
         if result.timestamp > 0:
             self.measurement_time = dt_util.utc_from_timestamp(
                 result.timestamp
@@ -115,7 +128,6 @@ class ViatomBP2Data:
             self.measurement_time = None
         self.last_update = time.monotonic()
         self.measurements.append(result)
-        # Limit stored measurements
         if len(self.measurements) > MAX_STORED_MEASUREMENTS:
             self.measurements = self.measurements[-MAX_STORED_MEASUREMENTS:]
 
@@ -145,10 +157,11 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         self._reassembler = PacketReassembler()
         self._reassembler.on_packet = self._handle_packet
         self._file_data_buffer = bytearray()
-        self._pending_files: list[str] = []
+        self._file_size: int = 0
+        self._file_offset: int = 0
         self._got_result = asyncio.Event()
         self._all_files_done = asyncio.Event()
-        self._all_files_done.set()  # No files pending initially
+        self._all_files_done.set()
         self._current_client: BleakClient | None = None
 
     @property
@@ -162,11 +175,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         service_info: BluetoothServiceInfoBleak,
         change: bluetooth.BluetoothChange,
     ) -> None:
-        """Handle a BLE advertisement from the BP2.
-
-        Called by HA's bluetooth stack when the device is detected.
-        We attempt to connect and retrieve data.
-        """
+        """Handle a BLE advertisement from the BP2."""
         self._data.rssi = service_info.rssi
         _LOGGER.debug(
             "BLE advertisement from %s (RSSI: %s, change: %s)",
@@ -174,10 +183,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             service_info.rssi,
             change,
         )
-        # Schedule connection attempt (avoid duplicate connections)
         if not self._connected and not self._connecting:
-            # Set flag immediately in callback (synchronous) to prevent
-            # duplicate scheduling from rapid BLE advertisements
             self._connecting = True
             self._entry.async_create_background_task(
                 self.hass,
@@ -189,7 +195,6 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         """Connect to the BP2, subscribe to notifications, and fetch data."""
         self._got_result.clear()
 
-        # Best practice: get a fresh BLEDevice each time (never reuse BleakClient)
         ble_device = bluetooth.async_ble_device_from_address(
             self.hass, self.address, connectable=True
         )
@@ -202,14 +207,11 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         try:
             _LOGGER.info("Connecting to BP2 at %s ...", self.address)
 
-            # Callback to get a fresh BLEDevice on retry — the device path may
-            # change between attempts (especially with ESPHome BLE proxies)
             def _ble_device_callback():
                 return bluetooth.async_ble_device_from_address(
                     self.hass, self.address, connectable=True
                 ) or ble_device
 
-            # Use bleak-retry-connector for reliable connections through proxies
             client = await establish_connection(
                 client_class=BleakClient,
                 device=ble_device,
@@ -221,70 +223,45 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             self._connected = True
             _LOGGER.info("Connected to BP2 at %s", self.address)
 
-            # Attempt BLE pairing/bonding — some Nordic devices require this
-            # before they respond to any application-level commands
-            try:
-                is_paired = await client.pair(protection_level=None)
-                _LOGGER.info("BLE pairing result: %s", is_paired)
-            except (BleakError, NotImplementedError, AttributeError) as e:
-                _LOGGER.info("BLE pairing not available or not needed: %s", e)
-            except Exception as e:
-                _LOGGER.debug("BLE pairing attempt failed: %s", e)
-
-            # --- DEBUG: dump all GATT services so we can verify UUIDs ---
-            for service in client.services:
-                _LOGGER.info(
-                    "GATT Service: %s (handle %s)",
-                    service.uuid, service.handle,
-                )
-                for char in service.characteristics:
-                    props = ",".join(char.properties)
-                    _LOGGER.info(
-                        "  Characteristic: %s [%s] (handle %s)",
-                        char.uuid, props, char.handle,
-                    )
-            # --- END DEBUG ---
-
-            # --- DIAGNOSTIC: Try reading all readable characteristics ---
-            _LOGGER.info("=== DIAGNOSTIC: Reading all characteristics ===")
-            for service in client.services:
-                for char in service.characteristics:
-                    if "read" in char.properties:
-                        try:
-                            val = await client.read_gatt_char(char.uuid)
-                            _LOGGER.info(
-                                "  READ %s => %s (%s)",
-                                char.uuid, val.hex(), repr(val),
-                            )
-                        except BleakError as e:
-                            _LOGGER.info("  READ %s => FAILED: %s", char.uuid, e)
-
             # Subscribe to notifications
             self._reassembler.reset()
-            _LOGGER.info("Subscribing to notifications on NOTIFY_UUID...")
             await client.start_notify(NOTIFY_UUID, self._notification_handler)
-            _LOGGER.info("Notification subscription OK")
 
-            # Send commands via WRITE characteristic
+            # === Protocol V2 init sequence (from HCI snoop) ===
+
+            # 1. Sync time
             _LOGGER.debug("Syncing time...")
             await self._write_command(client, build_sync_time())
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
 
-            _LOGGER.debug("Requesting device info...")
+            # 2. Get device info
+            _LOGGER.debug("Requesting device info (CMD 0x00)...")
             await self._write_command(client, build_get_info())
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
 
-            _LOGGER.debug("Requesting file list...")
-            await self._write_command(client, build_get_file_list())
+            # 3. Get extended device info
+            _LOGGER.debug("Requesting extended device info (CMD 0xE1)...")
+            await self._write_command(client, build_get_device_info())
+            await asyncio.sleep(0.3)
 
-            # Wait 3 seconds, then check if ANY notifications arrived
-            await asyncio.sleep(3)
-            _LOGGER.info(
-                "=== After 3s wait: notifications received = %s ===",
-                "YES" if self._got_result.is_set() else "NO",
+            # 4. Get config
+            _LOGGER.debug("Requesting config (CMD 0x33)...")
+            await self._write_command(client, build_get_config())
+            await asyncio.sleep(0.3)
+
+            # 5. Get battery
+            _LOGGER.debug("Requesting battery (CMD 0x30)...")
+            await self._write_command(client, build_get_battery())
+            await asyncio.sleep(0.3)
+
+            # 6. Read BP measurement file
+            _LOGGER.debug("Requesting BP file (bp2nibp.list)...")
+            self._all_files_done.clear()
+            await self._write_command(
+                client, build_read_file_start(FILE_BP_LIST)
             )
 
-            # Wait for initial data (RT result or first file parse)
+            # Wait for data
             try:
                 await asyncio.wait_for(self._got_result.wait(), timeout=30)
                 _LOGGER.info("Got measurement data from BP2")
@@ -294,7 +271,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                     "device may be idle or protocol needs tuning"
                 )
 
-            # Wait for any remaining file reads to complete before disconnecting
+            # Wait for file reads to complete
             try:
                 await asyncio.wait_for(self._all_files_done.wait(), timeout=30)
             except TimeoutError:
@@ -309,14 +286,20 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 await self._disconnect(client)
             self._current_client = None
             self._connecting = False
-            # Notify HA that data has been updated
             self.async_set_updated_data(self._data)
 
     async def _write_command(self, client: BleakClient, data: bytes) -> None:
-        """Write a command to the BP2 write characteristic."""
+        """Write a command to the BP2 write characteristic.
+
+        IMPORTANT: Protocol V2 requires write-without-response (WRITE_CMD).
+        Using WRITE_REQ (response=True) causes the device to silently
+        ignore all commands.
+        """
         if client.is_connected:
             try:
-                await client.write_gatt_char(WRITE_UUID, data, response=True)
+                await client.write_gatt_char(
+                    WRITE_UUID, data, response=False
+                )
                 _LOGGER.debug("Sent command: %s", data.hex())
             except BleakError as e:
                 _LOGGER.warning("Failed to write command: %s", e)
@@ -324,39 +307,62 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     def _notification_handler(
         self, _sender: Any, data: bytearray
     ) -> None:
-        """Handle raw BLE notification data.
-
-        Note: Bleak calls this from the event loop in modern versions,
-        so it is safe to call _reassembler.feed() which triggers
-        _handle_packet synchronously.
-        """
-        _LOGGER.debug("BLE notification (%d bytes): %s", len(data), data.hex())
+        """Handle raw BLE notification data."""
+        _LOGGER.debug(
+            "BLE notification (%d bytes): %s", len(data), data.hex()
+        )
         self._reassembler.feed(bytes(data))
 
     def _handle_packet(self, packet: LepuPacket) -> None:
-        """Handle a decoded Lepu protocol packet.
-
-        Called synchronously from notification_handler on the event loop.
-        """
+        """Handle a decoded Lepu protocol V2 packet."""
         _LOGGER.debug(
-            "Packet: cmd=0x%02X seq=%d payload_len=%d",
-            packet.cmd, packet.seq, len(packet.payload),
+            "Packet: cmd=0x%02X seq=0x%04X payload_len=%d",
+            packet.cmd,
+            packet.seq,
+            len(packet.payload),
         )
 
-        # Device info response
-        if packet.cmd in (0x14, 0x15):
+        # Sync time ACK (CMD 0xC0)
+        if packet.cmd == CMD_SYNC_TIME:
+            _LOGGER.info("Time sync acknowledged")
+
+        # Device info response (CMD 0x00)
+        elif packet.cmd == CMD_GET_INFO:
             info = parse_device_info(packet.payload)
             self._data.device_info = info
-            self._data.battery_level = info.battery_level
+            if info.battery_level > 0:
+                self._data.battery_level = info.battery_level
             _LOGGER.info(
                 "Device info: hw=%s fw=%s sn=%s battery=%d%%",
-                info.hw_version, info.fw_version,
-                info.serial_number, info.battery_level,
+                info.hw_version,
+                info.fw_version,
+                info.serial_number,
+                info.battery_level,
             )
 
-        # Real-time data
-        elif packet.cmd in (0x16, 0x17):
+        # Extended device info (CMD 0xE1)
+        elif packet.cmd == CMD_GET_DEVICE_INFO:
+            _LOGGER.info(
+                "Extended device info: %d bytes", len(packet.payload)
+            )
+
+        # Config response (CMD 0x33)
+        elif packet.cmd == CMD_GET_CONFIG:
+            _LOGGER.debug("Config: %s", packet.payload.hex())
+
+        # Battery response (CMD 0x30)
+        elif packet.cmd == CMD_GET_BATTERY:
+            level, status = parse_battery(packet.payload)
+            if level > 0:
+                self._data.battery_level = level
+                self._data.battery_status = status
+            _LOGGER.info("Battery: %d%% (status=%d)", level, status)
+
+        # Real-time data (CMD 0x08) — pushed by device
+        elif packet.cmd == CMD_RT_DATA:
             rt = parse_rt_data(packet.payload)
+            self._data.battery_level = rt.battery_level
+            self._data.device_status = rt.device_status
             new_result = self._data.update_from_rt(rt)
             if new_result:
                 _LOGGER.info(
@@ -366,63 +372,99 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                     self._data.pulse,
                 )
                 self._got_result.set()
+            elif rt.measuring:
+                _LOGGER.debug("Measuring... cuff pressure: %d", rt.cuff_pressure)
 
-        # File list response
-        elif packet.cmd in (0x18, 0x19):
-            files = parse_file_list(packet.payload)
-            _LOGGER.info("Device has %d stored files: %s", len(files), files)
-            self._pending_files = files
-            if files:
-                self._all_files_done.clear()
-                self._entry.async_create_background_task(
-                    self.hass,
-                    self._read_next_file(),
-                    name=f"viatom_bp2_read_file_{self.address}",
-                )
+        # File start response (CMD 0xF2) — returns file size
+        elif packet.cmd == CMD_READ_FILE_START:
+            if len(packet.payload) >= 4:
+                self._file_size = struct.unpack_from(
+                    "<I", packet.payload, 0
+                )[0]
+                _LOGGER.info("File size: %d bytes", self._file_size)
+                if self._file_size > 0:
+                    self._file_data_buffer.clear()
+                    self._file_offset = 0
+                    # Request first chunk
+                    self._entry.async_create_background_task(
+                        self.hass,
+                        self._request_file_chunk(0),
+                        name=f"viatom_bp2_file_{self.address}",
+                    )
+                else:
+                    self._all_files_done.set()
             else:
+                _LOGGER.warning(
+                    "Unexpected file start response: %s",
+                    packet.payload.hex(),
+                )
                 self._all_files_done.set()
 
-        # File data response
-        elif packet.cmd in (0x1A, 0x1B, 0x1C, 0x1D):
+        # File data response (CMD 0xF3) — contains chunked file data
+        elif packet.cmd == CMD_READ_FILE_DATA:
             self._file_data_buffer.extend(packet.payload)
+            self._file_offset += len(packet.payload)
+            _LOGGER.debug(
+                "File data chunk: %d bytes (total %d/%d)",
+                len(packet.payload),
+                len(self._file_data_buffer),
+                self._file_size,
+            )
+            # Request next chunk if more data remains
+            if self._file_offset < self._file_size:
+                self._entry.async_create_background_task(
+                    self.hass,
+                    self._request_file_chunk(self._file_offset),
+                    name=f"viatom_bp2_file_{self.address}",
+                )
+            else:
+                # File complete — request file end
+                self._entry.async_create_background_task(
+                    self.hass,
+                    self._finish_file_read(),
+                    name=f"viatom_bp2_file_end_{self.address}",
+                )
 
-        # File read complete
-        elif packet.cmd in (0x1E, 0x1F):
+        # File end ACK (CMD 0xF4)
+        elif packet.cmd == CMD_READ_FILE_END:
+            _LOGGER.debug("File read complete ACK")
+            # Parse the accumulated file data
             if self._file_data_buffer:
                 results = parse_bp_file(bytes(self._file_data_buffer))
                 for r in results:
                     self._data.update_from_bp_result(r)
                     _LOGGER.info(
                         "Stored BP: %d/%d mmHg, pulse %d @ %s",
-                        r.systolic, r.diastolic, r.pulse, r.timestamp_str,
+                        r.systolic,
+                        r.diastolic,
+                        r.pulse,
+                        r.timestamp_str,
                     )
                 self._file_data_buffer.clear()
                 if results:
                     self._got_result.set()
-            if self._pending_files:
-                self._entry.async_create_background_task(
-                    self.hass,
-                    self._read_next_file(),
-                    name=f"viatom_bp2_read_file_{self.address}",
-                )
-            else:
-                # All files processed
-                self._all_files_done.set()
+            self._all_files_done.set()
 
         else:
             _LOGGER.debug(
                 "Unhandled packet cmd=0x%02X payload=%s",
-                packet.cmd, packet.payload.hex(),
+                packet.cmd,
+                packet.payload.hex(),
             )
 
-    async def _read_next_file(self) -> None:
-        """Read the next file from the pending list."""
-        if not self._pending_files or self._current_client is None:
-            return
-        filename = self._pending_files.pop(0)
-        _LOGGER.debug("Reading file: %s", filename)
-        self._file_data_buffer.clear()
-        await self._write_command(self._current_client, build_read_file_start(filename))
+    async def _request_file_chunk(self, offset: int) -> None:
+        """Request a file data chunk at the given offset."""
+        if self._current_client is not None:
+            await self._write_command(
+                self._current_client, build_read_file_data(offset)
+            )
+
+    async def _finish_file_read(self) -> None:
+        """Send file read end command."""
+        if self._current_client is not None:
+            await self._write_command(
+                self._current_client, build_read_file_end()
+            )
 
     async def _disconnect(self, client: BleakClient) -> None:
         """Disconnect from the BP2."""
