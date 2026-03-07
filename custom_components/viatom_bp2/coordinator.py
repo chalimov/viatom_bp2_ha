@@ -68,6 +68,23 @@ MAX_STORED_MEASUREMENTS = 50
 # Maximum BLE connection retries
 MAX_CONNECT_RETRIES = 3
 
+# Alternative BLE characteristic UUIDs (8ec9XXXX service)
+# Some LP-BP2W devices use this service instead of the Lepu service
+ALT_NOTIFY_UUID = "8ec90001-f315-4f60-9fb8-838830daea50"
+ALT_WRITE_UUID = "8ec90002-f315-4f60-9fb8-838830daea50"
+
+# All candidate (write_uuid, notify_uuid, label) combinations to probe
+_CHAR_CANDIDATES = [
+    # 1. Standard Lepu: write to 8b00ace7, notify on 0734594a
+    (WRITE_UUID, NOTIFY_UUID, "Lepu write→notify"),
+    # 2. Alt service: write to 8ec90002 (w-o-r), notify on 8ec90001
+    (ALT_WRITE_UUID, ALT_NOTIFY_UUID, "Alt 8ec9 write→notify"),
+    # 3. Alt single-char: write to 8ec90001 (write+notify), notify on same
+    (ALT_NOTIFY_UUID, ALT_NOTIFY_UUID, "Alt 8ec9 single-char"),
+    # 4. Cross-service: write to Lepu 8b00ace7, notify on Alt 8ec90001
+    (WRITE_UUID, ALT_NOTIFY_UUID, "Lepu write→Alt notify"),
+]
+
 
 class ViatomBP2Data:
     """Container for the latest data from the BP2 device."""
@@ -164,6 +181,10 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         self._all_files_done.set()
         self._current_client: BleakClient | None = None
         self._last_disconnect: float = 0  # monotonic timestamp
+        self._notification_received = asyncio.Event()
+        # Active write UUID (may change during probing)
+        self._active_write_uuid: str = WRITE_UUID
+        self._active_notify_uuid: str = NOTIFY_UUID
 
     @property
     def bp_data(self) -> ViatomBP2Data:
@@ -229,9 +250,6 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             self._connected = True
             _LOGGER.info("Connected to BP2 at %s", self.address)
 
-            # Subscribe to notifications
-            self._reassembler.reset()
-
             # Log available services/characteristics for diagnostics
             for service in client.services:
                 for char in service.characteristics:
@@ -243,107 +261,33 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                         props,
                         len(char.descriptors),
                     )
-                    for desc in char.descriptors:
-                        _LOGGER.debug(
-                            "    Descriptor %s [%s]", desc.uuid, desc.handle
-                        )
 
-            await client.start_notify(NOTIFY_UUID, self._notification_handler)
+            # === Probe characteristic combinations ===
+            working_combo = await self._probe_characteristics(client)
+
+            if not working_combo:
+                _LOGGER.error(
+                    "No working characteristic combination found for %s. "
+                    "Tried all %d candidates — device may need direct "
+                    "Bluetooth (not ESPHome proxy) or a different protocol.",
+                    self.address,
+                    len(_CHAR_CANDIDATES),
+                )
+                return
+
+            write_uuid, notify_uuid, label = working_combo
+            self._active_write_uuid = write_uuid
+            self._active_notify_uuid = notify_uuid
             _LOGGER.info(
-                "Notification subscription sent for %s — "
-                "waiting 1.5s for CCCD write to propagate via proxy",
-                NOTIFY_UUID,
+                "Working characteristic combo: %s "
+                "(write=%s, notify=%s)",
+                label,
+                write_uuid,
+                notify_uuid,
             )
 
-            # Give the ESPHome proxy time to forward the CCCD write
-            # to the actual device before sending commands
-            await asyncio.sleep(1.5)
-
-            # Also try to manually write CCCD descriptor (0x2902)
-            # as a fallback in case start_notify didn't propagate
-            try:
-                notify_char = client.services.get_characteristic(NOTIFY_UUID)
-                if notify_char:
-                    for desc in notify_char.descriptors:
-                        if "2902" in str(desc.uuid):
-                            _LOGGER.info(
-                                "Manually writing CCCD descriptor %s "
-                                "(handle %s) to enable notifications",
-                                desc.uuid,
-                                desc.handle,
-                            )
-                            await client.write_gatt_descriptor(
-                                desc.handle, b"\x01\x00"
-                            )
-                            await asyncio.sleep(0.5)
-                            break
-                    else:
-                        _LOGGER.debug("No CCCD descriptor found on notify char")
-                else:
-                    _LOGGER.warning("Notify characteristic %s not found", NOTIFY_UUID)
-            except BleakError as e:
-                _LOGGER.debug("CCCD manual write failed (may be OK): %s", e)
-
-            # === Protocol V2 init sequence (from HCI snoop) ===
-
-            # 1. Sync time
-            _LOGGER.debug("Syncing time...")
-            await self._write_command(client, build_sync_time())
-            await asyncio.sleep(2.0)
-
-            # Quick check: did we get ANY notification after sync_time?
-            if self._data.device_info or self._data.battery_level is not None:
-                _LOGGER.info("Notification received after sync_time — protocol working")
-            else:
-                _LOGGER.warning(
-                    "No notification received after sync_time + 2s wait. "
-                    "Possible causes: (1) ESPHome proxy not forwarding "
-                    "notifications, (2) device not responding to V2 commands. "
-                    "Continuing with remaining commands..."
-                )
-
-            # 2. Get device info
-            _LOGGER.debug("Requesting device info (CMD 0x00)...")
-            await self._write_command(client, build_get_info())
-            await asyncio.sleep(0.3)
-
-            # 3. Get extended device info
-            _LOGGER.debug("Requesting extended device info (CMD 0xE1)...")
-            await self._write_command(client, build_get_device_info())
-            await asyncio.sleep(0.3)
-
-            # 4. Get config
-            _LOGGER.debug("Requesting config (CMD 0x33)...")
-            await self._write_command(client, build_get_config())
-            await asyncio.sleep(0.3)
-
-            # 5. Get battery
-            _LOGGER.debug("Requesting battery (CMD 0x30)...")
-            await self._write_command(client, build_get_battery())
-            await asyncio.sleep(0.3)
-
-            # 6. Read BP measurement file
-            _LOGGER.debug("Requesting BP file (bp2nibp.list)...")
-            self._all_files_done.clear()
-            await self._write_command(
-                client, build_read_file_start(FILE_BP_LIST)
-            )
-
-            # Wait for data
-            try:
-                await asyncio.wait_for(self._got_result.wait(), timeout=30)
-                _LOGGER.info("Got measurement data from BP2")
-            except TimeoutError:
-                _LOGGER.debug(
-                    "Timeout waiting for measurement result — "
-                    "device may be idle or protocol needs tuning"
-                )
-
-            # Wait for file reads to complete
-            try:
-                await asyncio.wait_for(self._all_files_done.wait(), timeout=30)
-            except TimeoutError:
-                _LOGGER.warning("Timeout waiting for file reads to complete")
+            # === Continue with full Protocol V2 init sequence ===
+            await self._run_init_sequence(client)
 
         except BleakError as e:
             _LOGGER.warning("BLE error with BP2 at %s: %s", self.address, e)
@@ -356,19 +300,190 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             self._connecting = False
             self.async_set_updated_data(self._data)
 
+    async def _probe_characteristics(
+        self, client: BleakClient
+    ) -> tuple[str, str, str] | None:
+        """Probe all characteristic combinations to find one that works.
+
+        Sends a sync_time command on each write UUID while listening for
+        notifications on each notify UUID. Returns the first combo that
+        yields a response, or None if none work.
+        """
+        self._reassembler.reset()
+
+        for write_uuid, notify_uuid, label in _CHAR_CANDIDATES:
+            # Check that both characteristics exist on this device
+            write_char = client.services.get_characteristic(write_uuid)
+            notify_char = client.services.get_characteristic(notify_uuid)
+            if not write_char or not notify_char:
+                _LOGGER.debug(
+                    "Skipping combo '%s': characteristic not found "
+                    "(write=%s notify=%s)",
+                    label,
+                    write_char is not None,
+                    notify_char is not None,
+                )
+                continue
+
+            # Check that notify char supports notifications
+            if "notify" not in notify_char.properties:
+                _LOGGER.debug(
+                    "Skipping combo '%s': notify char lacks notify property",
+                    label,
+                )
+                continue
+
+            _LOGGER.info(
+                "=== Probing combo '%s': write=%s notify=%s ===",
+                label,
+                write_uuid[:12],
+                notify_uuid[:12],
+            )
+
+            # Subscribe to notifications on this char
+            self._notification_received.clear()
+            try:
+                await client.start_notify(
+                    notify_uuid, self._notification_handler
+                )
+            except BleakError as e:
+                _LOGGER.debug(
+                    "Failed to subscribe on %s: %s", notify_uuid[:12], e
+                )
+                continue
+
+            # Give CCCD write time to propagate through ESPHome proxy
+            await asyncio.sleep(1.0)
+
+            # Send sync_time command on the write char
+            try:
+                cmd = build_sync_time()
+                # Determine write mode based on characteristic properties
+                use_response = "write-without-response" not in write_char.properties
+                await client.write_gatt_char(
+                    write_uuid, cmd, response=use_response
+                )
+                _LOGGER.info(
+                    "Sent sync_time on %s (response=%s): %s",
+                    write_uuid[:12],
+                    use_response,
+                    cmd.hex(),
+                )
+            except BleakError as e:
+                _LOGGER.debug(
+                    "Failed to write on %s: %s", write_uuid[:12], e
+                )
+                try:
+                    await client.stop_notify(notify_uuid)
+                except BleakError:
+                    pass
+                continue
+
+            # Wait for ANY notification to come back
+            try:
+                await asyncio.wait_for(
+                    self._notification_received.wait(), timeout=3.0
+                )
+                _LOGGER.info(
+                    "Got notification on combo '%s'! This is the working pair.",
+                    label,
+                )
+                # Don't unsubscribe — keep this subscription active
+                return (write_uuid, notify_uuid, label)
+            except TimeoutError:
+                _LOGGER.info(
+                    "No response on combo '%s' after 3s", label
+                )
+
+            # Clean up this subscription before trying next combo
+            try:
+                await client.stop_notify(notify_uuid)
+            except BleakError:
+                pass
+            await asyncio.sleep(0.3)
+
+        return None
+
+    async def _run_init_sequence(self, client: BleakClient) -> None:
+        """Run the full Protocol V2 init sequence after finding working chars."""
+        write_uuid = self._active_write_uuid
+
+        # sync_time was already sent during probing, but send again
+        # to ensure clean state
+        _LOGGER.debug("Sending full init sequence...")
+
+        # 1. Sync time (re-send for clean state)
+        await self._write_command(client, build_sync_time())
+        await asyncio.sleep(0.5)
+
+        # 2. Get device info
+        _LOGGER.debug("Requesting device info (CMD 0x00)...")
+        await self._write_command(client, build_get_info())
+        await asyncio.sleep(0.5)
+
+        # 3. Get extended device info
+        _LOGGER.debug("Requesting extended device info (CMD 0xE1)...")
+        await self._write_command(client, build_get_device_info())
+        await asyncio.sleep(0.5)
+
+        # 4. Get config
+        _LOGGER.debug("Requesting config (CMD 0x33)...")
+        await self._write_command(client, build_get_config())
+        await asyncio.sleep(0.5)
+
+        # 5. Get battery
+        _LOGGER.debug("Requesting battery (CMD 0x30)...")
+        await self._write_command(client, build_get_battery())
+        await asyncio.sleep(0.5)
+
+        # 6. Read BP measurement file
+        _LOGGER.debug("Requesting BP file (bp2nibp.list)...")
+        self._all_files_done.clear()
+        await self._write_command(
+            client, build_read_file_start(FILE_BP_LIST)
+        )
+
+        # Wait for data
+        try:
+            await asyncio.wait_for(self._got_result.wait(), timeout=30)
+            _LOGGER.info("Got measurement data from BP2")
+        except TimeoutError:
+            _LOGGER.debug(
+                "Timeout waiting for measurement result — "
+                "device may be idle or protocol needs tuning"
+            )
+
+        # Wait for file reads to complete
+        try:
+            await asyncio.wait_for(self._all_files_done.wait(), timeout=30)
+        except TimeoutError:
+            _LOGGER.warning("Timeout waiting for file reads to complete")
+
     async def _write_command(self, client: BleakClient, data: bytes) -> None:
-        """Write a command to the BP2 write characteristic.
+        """Write a command to the active write characteristic.
 
         IMPORTANT: Protocol V2 requires write-without-response (WRITE_CMD).
         Using WRITE_REQ (response=True) causes the device to silently
-        ignore all commands.
+        ignore all commands on the Lepu service. For other services,
+        we auto-detect from characteristic properties.
         """
         if client.is_connected:
             try:
-                await client.write_gatt_char(
-                    WRITE_UUID, data, response=False
+                write_char = client.services.get_characteristic(
+                    self._active_write_uuid
                 )
-                _LOGGER.debug("Sent command: %s", data.hex())
+                use_response = (
+                    write_char is not None
+                    and "write-without-response" not in write_char.properties
+                )
+                await client.write_gatt_char(
+                    self._active_write_uuid, data, response=use_response
+                )
+                _LOGGER.debug(
+                    "Sent command on %s: %s",
+                    self._active_write_uuid[:12],
+                    data.hex(),
+                )
             except BleakError as e:
                 _LOGGER.warning("Failed to write command: %s", e)
 
@@ -385,6 +500,8 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         _LOGGER.debug(
             "BLE notification (%d bytes): %s", len(raw), raw.hex()
         )
+        # Signal that we received at least one notification (for probing)
+        self._notification_received.set()
         self.hass.loop.call_soon_threadsafe(self._reassembler.feed, raw)
 
     def _handle_packet(self, packet: LepuPacket) -> None:
@@ -447,7 +564,9 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 )
                 self._got_result.set()
             elif rt.measuring:
-                _LOGGER.debug("Measuring... cuff pressure: %d", rt.cuff_pressure)
+                _LOGGER.debug(
+                    "Measuring... cuff pressure: %d", rt.cuff_pressure
+                )
 
         # File start response (CMD 0xF2) — returns file size
         elif packet.cmd == CMD_READ_FILE_START:
@@ -544,10 +663,12 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         """Disconnect from the BP2."""
         try:
             if client.is_connected:
-                try:
-                    await client.stop_notify(NOTIFY_UUID)
-                except BleakError:
-                    pass
+                # Stop notifications on whichever char was active
+                for uuid in {self._active_notify_uuid, NOTIFY_UUID, ALT_NOTIFY_UUID}:
+                    try:
+                        await client.stop_notify(uuid)
+                    except BleakError:
+                        pass
                 await client.disconnect()
         except BleakError:
             pass
