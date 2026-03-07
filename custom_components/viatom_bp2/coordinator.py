@@ -285,7 +285,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         """Write a command to the BP2 write characteristic."""
         if client.is_connected:
             try:
-                await client.write_gatt_char(WRITE_UUID, data, response=False)
+                await client.write_gatt_char(WRITE_UUID, data, response=True)
                 _LOGGER.debug("Sent command: %s", data.hex())
             except BleakError as e:
                 _LOGGER.warning("Failed to write command: %s", e)
