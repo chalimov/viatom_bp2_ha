@@ -21,6 +21,10 @@
     {
       "local_name": "LP-BP2*",
       "connectable": true
+    },
+    {
+      "local_name": "Checkme BP2*",
+      "connectable": true
     }
   ],
   "integration_type": "device",

@@ -121,9 +121,9 @@ class ViatomBP2Data:
         self.mean_arterial_pressure = result.mean_arterial_pressure
         self.irregular_heartbeat = result.irregular_heartbeat
         if result.timestamp > 0:
-            self.measurement_time = dt_util.utc_from_timestamp(
-                result.timestamp
-            ).astimezone(dt_util.DEFAULT_TIME_ZONE)
+            self.measurement_time = dt_util.as_local(
+                dt_util.utc_from_timestamp(result.timestamp)
+            )
         else:
             self.measurement_time = None
         self.last_update = time.monotonic()
@@ -163,6 +163,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         self._all_files_done = asyncio.Event()
         self._all_files_done.set()
         self._current_client: BleakClient | None = None
+        self._last_disconnect: float = 0  # monotonic timestamp
 
     @property
     def bp_data(self) -> ViatomBP2Data:
@@ -183,7 +184,12 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             service_info.rssi,
             change,
         )
-        if not self._connected and not self._connecting:
+        # Cooldown: avoid reconnecting within 5 seconds of last disconnect
+        if (
+            not self._connected
+            and not self._connecting
+            and time.monotonic() - self._last_disconnect > 5
+        ):
             self._connecting = True
             self._entry.async_create_background_task(
                 self.hass,
@@ -307,11 +313,17 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     def _notification_handler(
         self, _sender: Any, data: bytearray
     ) -> None:
-        """Handle raw BLE notification data."""
+        """Handle raw BLE notification data.
+
+        This callback may be invoked from a background thread (direct BT
+        adapters) or from the event loop (ESPHome proxies). We schedule
+        the actual processing on the event loop for thread safety.
+        """
+        raw = bytes(data)
         _LOGGER.debug(
-            "BLE notification (%d bytes): %s", len(data), data.hex()
+            "BLE notification (%d bytes): %s", len(raw), raw.hex()
         )
-        self._reassembler.feed(bytes(data))
+        self.hass.loop.call_soon_threadsafe(self._reassembler.feed, raw)
 
     def _handle_packet(self, packet: LepuPacket) -> None:
         """Handle a decoded Lepu protocol V2 packet."""
@@ -479,6 +491,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             pass
         finally:
             self._connected = False
+            self._last_disconnect = time.monotonic()
             _LOGGER.info("Disconnected from BP2 at %s", self.address)
 
     async def _async_update_data(self) -> ViatomBP2Data:

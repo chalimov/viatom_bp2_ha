@@ -139,6 +139,11 @@ CMD_READ_FILE_START = 0xF2
 CMD_READ_FILE_DATA = 0xF3
 CMD_READ_FILE_END = 0xF4
 
+# Device status codes
+STATUS_READY = 3
+STATUS_BP_MEASURING = 4
+STATUS_BP_MEASURE_END = 5
+
 # Known filenames on the device
 FILE_USER_LIST = "user.list"
 FILE_BP_LIST = "bp2nibp.list"
@@ -262,15 +267,15 @@ def parse_rt_data(payload: bytes) -> RtData:
             rt.battery_level = payload[2]
         if len(payload) >= 5:
             rt.cuff_pressure = struct.unpack_from("<H", payload, 3)[0]
-        # When device_status == 5 (STATUS_BP_MEASURE_END), the result follows
-        if rt.device_status == 5 and len(payload) >= 15:
+        # When device_status == STATUS_BP_MEASURE_END, the result follows
+        if rt.device_status == STATUS_BP_MEASURE_END and len(payload) >= 13:
             rt.result_ready = True
             rt.systolic = struct.unpack_from("<H", payload, 5)[0]
             rt.diastolic = struct.unpack_from("<H", payload, 7)[0]
             rt.mean_arterial_pressure = struct.unpack_from("<H", payload, 9)[0]
             rt.pulse = struct.unpack_from("<H", payload, 11)[0]
             rt.measuring = False
-        elif rt.device_status == 4:
+        elif rt.device_status == STATUS_BP_MEASURING:
             rt.measuring = True
     except Exception as e:
         _LOGGER.warning(
@@ -331,8 +336,8 @@ def parse_bp_file(payload: bytes) -> list[BpResult]:
                 ts = 0
                 for ts_off in range(offset + 8, min(offset + 28, len(payload) - 3)):
                     candidate = struct.unpack_from("<I", payload, ts_off)[0]
-                    # Valid unix timestamp: between 2020 and 2030
-                    if 1577836800 <= candidate <= 1893456000:
+                    # Valid unix timestamp: between 2020 and 2040
+                    if 1577836800 <= candidate <= 2208988800:
                         ts = candidate
                         break
 
