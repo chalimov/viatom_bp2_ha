@@ -3,30 +3,40 @@
 Uses a persistent BLE connection with CMD 0x06 (GET_CONFIG) state polling
 to detect measurement activity and fetch results at the right time.
 
-NOTE: CMD 0x00 (GET_INFO) does NOT get responses through ESPHome BLE proxies.
-CMD 0x06 (GET_CONFIG) returns device state at byte[0] and works reliably.
+NOTE: CMD 0x00 (GET_INFO) does NOT get responses through ESPHome BLE proxies,
+but the command DOES reach the device. CMD 0x00 appears to have a side effect
+of resetting the device's internal file transfer state machine, which is
+required before starting a second file transfer on the same connection.
+CMD 0x06 (GET_CONFIG) returns device state at byte[0] and works reliably
+for polling, but does NOT reset the file transfer state.
 
-Algorithm (validated by direct BLE testing with bp2_counter_watch.py):
+Algorithm (validated by real-world ESPHome proxy testing):
 
-  PHASE 1 — CONNECTION
+  PHASE 1 — CONNECTION + FETCH
     Advertisement seen → connect + subscribe → housekeeping (battery,
     device info, time sync) → baseline file fetch → enter poll loop.
 
   PHASE 2 — POLL LOOP (CMD 0x06 every ~5s)
-    Tracks two flags: saw_activity, fetched_this_cycle.
-
     State 4/15/16 (busy):  set saw_activity, wait
-    State 5/17 (result):   fetch file if not fetched_this_cycle
-    State 3 (idle):        fetch file if saw_activity and not fetched_this_cycle
-    Transition 5/17→3:     reset both flags (ready for next cycle)
+    State 5/17 (result):   fetch file data (in-connection), reset cycle
+    State 3 (idle) after activity: fetch (missed RESULT window), reset cycle
+
+    NOTE: Multiple file transfers per connection require a CMD 0x00
+    (GET_INFO) between transfers to reset the device's file transfer
+    state. Without this, FILE_START returns 0xe1 "not ready". The
+    Windows BLE script uses CMD 0x00 for state polling, which
+    provides this reset implicitly. Our ESPHome proxy flow uses
+    CMD 0x06 for polling (CMD 0x00 responses don't arrive through
+    the proxy), so we send CMD 0x00 explicitly as a fire-and-forget
+    state reset before each non-initial file transfer.
 
   PHASE 3 — DISCONNECT
-    Connection lost, or idle timeout (120s of continuous state 3 with
-    no activity after baseline fetch) → disconnect, free BLE proxy slot.
+    Connection lost or idle timeout (120s) → disconnect, then
+    reconnect loop tries to re-establish connection.
 
 SAFE commands (no screen change, invisible to user):
-  CMD 0x06 (GET_CONFIG), 0x30 (GET_BATTERY), 0xE1 (GET_DEVICE_INFO),
-  0xEC (SYNC_TIME), 0xF1 (READ_FILE_LIST)
+  CMD 0x00 (GET_INFO), 0x06 (GET_CONFIG), 0x30 (GET_BATTERY),
+  0xE1 (GET_DEVICE_INFO), 0xEC (SYNC_TIME), 0xF1 (READ_FILE_LIST)
 
 VISUAL commands (show brief transfer icon, auto-resolves on disconnect):
   0xF2 (READ_FILE_START), 0xF3 (READ_FILE_DATA), 0xF4 (READ_FILE_END)
@@ -478,18 +488,21 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             )
 
     # ------------------------------------------------------------------
-    # PHASE 2: Poll loop — CMD 0x06 every 5s, state-based fetch triggers
+    # PHASE 2: Poll loop — CMD 0x06 every 5s, detect measurement activity
     # ------------------------------------------------------------------
     async def _poll_loop(self, client: BleakClient) -> None:
-        """Poll device state via CMD 0x06 and fetch BP data when appropriate.
+        """Poll device state via CMD 0x06, fetch data in-connection when ready.
 
-        Runs until the device disconnects or idle timeout is reached.
+        When a measurement completes (RESULT state seen, or IDLE after
+        activity), fetches the file data on the SAME connection.  Multiple
+        file transfers per connection require a CMD 0x00 (GET_INFO) to reset
+        the device's file transfer state machine — see _fetch_bp_data.
 
         State machine:
           4/15/16 (busy)   → saw_activity = True, wait
-          5/17 (result)    → fetch if not fetched_this_cycle
-          3 (idle)         → fetch if saw_activity and not fetched_this_cycle
-          Transition 5/17→3 → reset flags (new cycle)
+          5/17 (result)    → fetch file data, reset cycle
+          3 (idle) after activity → fetch (missed RESULT), reset cycle
+          3 (idle) no activity → track idle duration for disconnect timeout
         """
         idle_since: float | None = None  # monotonic time when idle streak started
         consecutive_errors = 0
@@ -518,59 +531,53 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             # --- Track measurement activity ---
             if state in DEVICE_STATES_BUSY:
                 self._saw_activity = True
+                self._fetched_this_cycle = False
                 idle_since = None  # not idle
                 _LOGGER.debug("State %d (%s) — measurement in progress", state, state_name)
 
             elif state in DEVICE_STATES_RESULT:
-                self._saw_activity = True
-                idle_since = None  # not idle
+                idle_since = None
                 if not self._fetched_this_cycle:
+                    # Measurement complete — result is on screen, fetch new data
                     _LOGGER.info(
-                        "State %d (%s) — result on screen, fetching data",
+                        "State %d (%s) — result on screen, fetching new data",
                         state,
                         state_name,
                     )
                     new_count = await self._fetch_bp_data(client)
+                    _LOGGER.info(
+                        "Phase 2 fetch: %d new records (%d total known)",
+                        new_count,
+                        len(self._data._known_keys),
+                    )
+                    self.async_set_updated_data(self._data)
                     self._fetched_this_cycle = True
                     self._saw_activity = False
-                    if new_count > 0:
-                        _LOGGER.info("Fetched %d new record(s)", new_count)
-                        self.async_set_updated_data(self._data)
-                else:
-                    _LOGGER.debug(
-                        "State %d (%s) — already fetched this cycle", state, state_name
-                    )
 
             elif state == DEVICE_STATE_IDLE:
-                # Fetch ONLY if we missed the RESULT window entirely
-                # (user dismissed result before we polled state 5/17)
                 if self._saw_activity and not self._fetched_this_cycle:
+                    # User dismissed result screen before we polled it
                     _LOGGER.info(
-                        "State 3 (IDLE) — missed RESULT window, fetching data"
+                        "State 3 (IDLE) — missed RESULT window, fetching new data"
                     )
                     new_count = await self._fetch_bp_data(client)
+                    _LOGGER.info(
+                        "Phase 2 fetch (missed window): %d new records (%d total known)",
+                        new_count,
+                        len(self._data._known_keys),
+                    )
+                    self.async_set_updated_data(self._data)
                     self._fetched_this_cycle = True
                     self._saw_activity = False
-                    if new_count > 0:
-                        _LOGGER.info("Fetched %d new record(s)", new_count)
-                        self.async_set_updated_data(self._data)
+
+                # Reset cycle when returning to idle after a fetched result
+                if self._prev_state in DEVICE_STATES_RESULT and self._fetched_this_cycle:
+                    self._fetched_this_cycle = False
+                    self._saw_activity = False
 
                 # Track idle duration for disconnect timeout
                 if idle_since is None:
                     idle_since = time.monotonic()
-
-            # --- Cycle reset: result → idle transition ---
-            if (
-                state == DEVICE_STATE_IDLE
-                and self._prev_state is not None
-                and self._prev_state in DEVICE_STATES_RESULT
-            ):
-                _LOGGER.debug(
-                    "Cycle reset: state %d→3 (result dismissed, ready for next)",
-                    self._prev_state,
-                )
-                self._fetched_this_cycle = False
-                self._saw_activity = False
 
             self._prev_state = state
 
@@ -613,26 +620,37 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     async def _fetch_bp_data(self, client: BleakClient) -> int:
         """Download bp2nibp.list and ingest records.
 
-        Before starting a new file transfer, sends a cleanup FILE_END using
-        _send_and_wait to properly reset the device's file transfer state.
-        This is essential after a completed transfer (Phase 1 baseline or
-        previous Phase 2 fetch) — without it, the device responds to
-        FILE_START with 0xe1 "not ready" and an empty payload.
+        KEY INSIGHT: The device's file transfer state machine must be reset
+        between transfers.  The Windows BLE script (bp2_counter_watch.py)
+        achieves this implicitly because it polls with CMD 0x00 (GET_INFO)
+        between transfers — CMD 0x00 resets the file transfer state as a
+        side effect.
 
-        The cleanup FILE_END is synchronized via _send_and_wait (waits for
-        the device's FILE_END ACK) to avoid the timing collision that occurs
-        with raw _write_command + sleep through ESPHome proxies.
+        Through ESPHome BLE proxies CMD 0x00 responses don't arrive (the
+        40-byte payload gets lost in proxy fragmentation), but the command
+        itself DOES reach the device and triggers the state reset.  So we
+        send CMD 0x00 as fire-and-forget before each file transfer to ensure
+        the device is ready.  CMD 0x06 (GET_CONFIG), which we use for
+        polling, does NOT have this side effect.
+
+        We also reset the PacketReassembler buffer before each attempt to
+        clear any stale bytes that might have accumulated from proxy
+        forwarding glitches.
 
         Returns the number of NEW records found (after deduplication).
         """
-        # Send cleanup FILE_END to reset any lingering file transfer state.
-        # Uses _send_and_wait to ensure the ACK is received before proceeding.
-        # If this times out (no prior transfer state to reset), that's fine.
-        _LOGGER.debug("Sending cleanup FILE_END to reset file transfer state")
-        await self._send_and_wait(client, build_read_file_end(), timeout=3.0)
+        # --- Reset device file transfer state ---
+        # Send CMD 0x00 (GET_INFO) as fire-and-forget.  The response won't
+        # arrive through the ESPHome proxy, but the command reaches the device
+        # and resets its internal file transfer state machine.  This is the
+        # same command the Windows script sends between transfers (via its
+        # polling loop), which is why it can do multiple transfers per connection.
+        _LOGGER.debug("Sending CMD 0x00 (GET_INFO) to reset file transfer state")
+        await self._write_command(client, build_get_info())
+        await asyncio.sleep(1.0)  # allow device to process + discard proxy response
 
-        # Additional settle time after FILE_END ACK for ESPHome proxy
-        await asyncio.sleep(0.5)
+        # Clear reassembler buffer of any stale bytes (partial proxy responses, etc.)
+        self._reassembler.reset()
 
         # Attempt file download with retries on empty response
         for attempt in range(MAX_FILE_FETCH_RETRIES):
@@ -642,6 +660,9 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             self._all_files_done.clear()
             self._last_fetch_new_count = 0
 
+            _LOGGER.debug(
+                "FILE_START attempt %d/%d", attempt + 1, MAX_FILE_FETCH_RETRIES
+            )
             await self._write_command(
                 client, build_read_file_start(FILE_BP_LIST)
             )
@@ -666,14 +687,16 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             if self._last_fetch_new_count > 0 or self._file_size > 0:
                 return self._last_fetch_new_count
 
-            # Empty response — send FILE_END to reset state, then retry
+            # Empty/error response — try CMD 0x00 reset again before retry
             _LOGGER.info(
-                "FILE_START returned empty (attempt %d/%d) — sending FILE_END and retrying",
+                "FILE_START returned empty/error (attempt %d/%d) — "
+                "retrying with CMD 0x00 reset",
                 attempt + 1,
                 MAX_FILE_FETCH_RETRIES,
             )
-            await self._send_and_wait(client, build_read_file_end(), timeout=3.0)
-            await asyncio.sleep(0.5)
+            await self._write_command(client, build_get_info())
+            await asyncio.sleep(1.0)
+            self._reassembler.reset()
 
         _LOGGER.warning(
             "FILE_START returned empty after %d attempts", MAX_FILE_FETCH_RETRIES
@@ -956,11 +979,11 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         after disconnect — the ESPHome proxy can cache the device address and
         HA may not report repeated identical advertisements as "changes".
 
-        This loop checks every 15s for up to 120s whether the device is
-        available, and initiates a connection if found.
+        Checks every 15s for up to 120s.
         """
         _LOGGER.info("Starting reconnect loop for %s", self.address)
-        for attempt in range(8):  # 8 × 15s = 120s
+
+        for attempt in range(8):  # 8 attempts × 15s = 120s
             await asyncio.sleep(15)
 
             # Bail if someone else already connected
