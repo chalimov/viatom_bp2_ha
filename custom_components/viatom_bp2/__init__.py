@@ -58,6 +58,9 @@ async def async_setup_entry(
     # Store coordinator in runtime_data (modern HA pattern, auto-cleaned on unload)
     entry.runtime_data = coordinator
 
+    # Clean up background tasks and BLE connections on unload
+    entry.async_on_unload(coordinator.async_shutdown)
+
     # Listen for options updates (user changes name mapping)
     entry.async_on_unload(entry.add_update_listener(_async_update_options))
 

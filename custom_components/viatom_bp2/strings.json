@@ -25,6 +25,9 @@
         "title": "User Name Mapping",
         "description": "Enter friendly names for each discovered user ID. These are Viatom cloud account numbers that appear in BP records. Leave blank to show the numeric ID."
       }
+    },
+    "abort": {
+      "no_users_found": "No user IDs discovered yet. Take a measurement first, then return here."
     }
   },
   "entity": {

@@ -12,12 +12,12 @@ Works through **ESPHome Bluetooth Proxies** — no phone or ViHealth app needed.
 - **Stored readings** — downloads BP history files from device memory (up to 50 readings)
 - **Combined Blood Pressure sensor** — shows "125/82" format with measurement history attribute
 - Exposes sensors: Blood Pressure (combined), Systolic, Diastolic, Heart Rate, MAP, Pulse Pressure, Battery, RSSI, Irregular Heartbeat flag
-- **Persistent BLE connection** — stays connected with CMD 0x00 state polling to detect measurements without disturbing the user
+- **Persistent BLE connection** — stays connected with CMD 0x06 state polling to detect measurements without disturbing the user
 - **ESPHome BLE Proxy compatible** — works through ESP32 proxies placed near the monitor
 
 ## Requirements
 
-- Home Assistant 2025.12.0+
+- Home Assistant 2025.1.0+
 - ESPHome BLE proxy (ESP32) within range of the BP2 device
 - Viatom BP2, BP2A, or BP2W blood pressure monitor
 
@@ -52,7 +52,7 @@ PHASE 1 — Connection:
     → Baseline fetch: downloads BP measurement file → parses → updates sensors
 
 PHASE 2 — Monitoring (stays connected):
-    → Polls device state every 5s (CMD 0x00, invisible to user)
+    → Polls device state every 5s (CMD 0x06, invisible to user)
     → Detects measurement activity (states 4/15/16 = busy, 5/17 = result)
     → Downloads new records when measurement completes
     → Handles single, triple, and back-to-back measurements

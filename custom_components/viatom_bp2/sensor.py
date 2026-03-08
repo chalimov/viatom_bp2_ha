@@ -151,6 +151,7 @@ class ViatomBP2Sensor(CoordinatorEntity[ViatomBP2Coordinator], SensorEntity):
             manufacturer=MANUFACTURER,
             model="BP2",
         )
+        self._device_info_updated = False
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -160,10 +161,9 @@ class ViatomBP2Sensor(CoordinatorEntity[ViatomBP2Coordinator], SensorEntity):
 
         # Update device info with firmware/hardware versions once available
         if (
-            data.device_info
+            not self._device_info_updated
+            and data.device_info
             and data.device_info.fw_version
-            and self._attr_device_info
-            and not self._attr_device_info.get("sw_version")  # type: ignore[union-attr]
         ):
             self._attr_device_info = DeviceInfo(
                 identifiers={(DOMAIN, self.coordinator.address)},
@@ -173,6 +173,7 @@ class ViatomBP2Sensor(CoordinatorEntity[ViatomBP2Coordinator], SensorEntity):
                 sw_version=data.device_info.fw_version,
                 hw_version=data.device_info.hw_version or None,
             )
+            self._device_info_updated = True
 
         if key == "blood_pressure":
             # Combined sys/dia display: "125/82"

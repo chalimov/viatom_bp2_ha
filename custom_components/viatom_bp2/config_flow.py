@@ -105,11 +105,12 @@ class ViatomBP2ConfigFlow(ConfigFlow, domain=DOMAIN):
             )
 
         # Find BP2 devices in current bluetooth discoveries
+        current_ids = self._async_current_ids()
         discovered: dict[str, str] = {}
         for info in bluetooth.async_discovered_service_info(
             self.hass, connectable=True
         ):
-            if self._is_bp2(info):
+            if info.address not in current_ids and self._is_bp2(info):
                 discovered[info.address] = (
                     f"{info.name or 'Unknown'} ({info.address})"
                 )
@@ -208,14 +209,7 @@ class ViatomBP2OptionsFlow(OptionsFlow):
                     )
                 ] = str
         else:
-            # No user IDs discovered yet — show a message
-            # We'll add a dummy field to show the form
-            schema_dict[
-                vol.Optional(
-                    "no_users_note",
-                    default="No user IDs discovered yet. Take a measurement first, then return here.",
-                )
-            ] = str
+            return self.async_abort(reason="no_users_found")
 
         return self.async_show_form(
             step_id="init",

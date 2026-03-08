@@ -174,48 +174,39 @@ class RtData:
 
 # LP-BP2W specific commands (from decompiled iffb.class)
 CMD_GET_INFO = 0x00           # SAFE — LP-BP2W GET_INFO (returns 40-byte device info)
-CMD_FACTORY_RESET = 0x04      # DANGER — factory reset!
 CMD_GET_CONFIG = 0x06         # SAFE — returns device config
-CMD_RT_DATA = 0x08            # UNTESTED — real-time data (BP measurement in progress)
-# DANGER — DO NOT USE on LP-BP2W! These start a BP measurement (cuff inflates):
-CMD_SWITCH_STATE = 0x09       # DANGER — starts BP measurement on LP-BP2W!
-CMD_START_MEASUREMENT = 0x0A  # DANGER — starts BP measurement on LP-BP2W!
-# (0x0A was labeled "ECHO" in SDK decompilation but actually starts measurement)
-CMD_GET_FILE_LIST = 0x11      # UNTESTED — LP-BP2W file list
-CMD_LP_READ_FILE_START = 0x12 # UNTESTED — LP-BP2W file read start
-CMD_LP_READ_FILE_DATA = 0x13  # UNTESTED — LP-BP2W file read data
+CMD_RT_DATA = 0x08            # Real-time data (BP measurement in progress)
 
 # Standard BP2 commands (from UniversalBleCmd.java — also work on LP-BP2W)
 CMD_GET_DEVICE_INFO = 0xE1    # SAFE — returns 60-byte info w/ serial
-CMD_RESET = 0xE2              # DANGER — device reset
-CMD_FACTORY_RESET_STD = 0xE3  # DANGER — factory reset
 CMD_SYNC_TIME = 0xEC          # SAFE — sync time
-CMD_READ_FILE_LIST = 0xF1     # SAFE — returns file names
 CMD_READ_FILE_START = 0xF2    # VISUAL — shows transfer icon, starts file read
 CMD_READ_FILE_DATA = 0xF3     # VISUAL — file data chunk (part of transfer)
 CMD_READ_FILE_END = 0xF4      # VISUAL — ends file transfer, icon disappears
-
-# Device status codes (from Bp2BleInterface.kt)
-STATUS_READY = 0
-STATUS_BP_MEASURING = 1       # RT data type 0 = BP measuring
-STATUS_BP_MEASURE_END = 1     # RT data type 1 = BP end (result available)
-STATUS_ECG_MEASURING = 2
-STATUS_ECG_END = 3
-
-# Known filenames on the device
-# NOTE: user.list does NOT exist on LP-BP2W. Only these two files:
-FILE_BP_LIST = "bp2nibp.list"
-FILE_ECG_LIST = "bp2ecg.list"
-
-# Additional safe commands (verified by direct BLE testing)
-CMD_GET_BATTERY = 0x30        # SAFE — 4 bytes: [status] [unknown] [voltage_lo] [voltage_hi]
-CMD_RT_STATE = 0x31           # SAFE but USELESS — returns random garbage each call
-CMD_RT_PRESSURE = 0x32        # SAFE — 4 bytes (real-time pressure)
 CMD_GET_LP_CONFIG = 0x33      # SAFE — 4 bytes
 
-# Additional danger commands discovered during full 0x00-0xFF scan
-CMD_DANGER_DEVICE_OFF = 0x24  # DANGER — device off + cuff inflation
-CMD_DANGER_INFLATE = 0x39     # DANGER — cuff inflation + BLE disconnect
+# Device status codes (from Bp2BleInterface.kt)
+STATUS_BP_MEASURING = 0       # RT data type 0 = BP measuring
+STATUS_BP_MEASURE_END = 1     # RT data type 1 = BP end (result available)
+
+# Known filenames on the device
+FILE_BP_LIST = "bp2nibp.list"
+
+# --- Unused / dangerous commands (kept for protocol documentation only) ---
+# DANGER — DO NOT USE on LP-BP2W! These start a BP measurement (cuff inflates):
+_CMD_FACTORY_RESET = 0x04      # DANGER — factory reset!
+_CMD_SWITCH_STATE = 0x09       # DANGER — starts BP measurement on LP-BP2W!
+_CMD_START_MEASUREMENT = 0x0A  # DANGER — starts BP measurement on LP-BP2W!
+_CMD_RESET = 0xE2              # DANGER — device reset
+_CMD_FACTORY_RESET_STD = 0xE3  # DANGER — factory reset
+_CMD_DANGER_DEVICE_OFF = 0x24  # DANGER — device off + cuff inflation
+_CMD_DANGER_INFLATE = 0x39     # DANGER — cuff inflation + BLE disconnect
+# Untested / unused safe commands:
+_CMD_GET_FILE_LIST = 0x11      # LP-BP2W file list
+_CMD_LP_READ_FILE_START = 0x12 # LP-BP2W file read start
+_CMD_LP_READ_FILE_DATA = 0x13  # LP-BP2W file read data
+_CMD_READ_FILE_LIST = 0xF1     # Standard file list
+_FILE_ECG_LIST = "bp2ecg.list"
 
 # ---------------------------------------------------------------------------
 # Device states (CMD 0x00 byte[39] / CMD 0x06 byte[0])
@@ -512,8 +503,6 @@ def parse_bp_file(payload: bytes) -> list[BpResult]:
 
         for i in range(num_records):
             rec = record_data[i * RECORD_SIZE : (i + 1) * RECORD_SIZE]
-            if len(rec) < 21:
-                break
 
             timestamp = struct.unpack_from("<I", rec, 0)[0]
             user_id = struct.unpack_from("<I", rec, 4)[0]
@@ -523,8 +512,20 @@ def parse_bp_file(payload: bytes) -> list[BpResult]:
             map_val = struct.unpack_from("<H", rec, 17)[0]   # MAP (mmHg)
             heart_rate = struct.unpack_from("<H", rec, 19)[0]  # HR (bpm)
 
-            # Skip obviously invalid records (empty slots)
+            # Skip obviously invalid records (empty slots or corrupt data)
             if systolic == 0 or diastolic == 0:
+                continue
+            if not (40 <= systolic <= 300) or not (20 <= diastolic <= 250):
+                _LOGGER.debug(
+                    "Implausible BP %d/%d in record %d, skipping",
+                    systolic, diastolic, i,
+                )
+                continue
+            if not (20 <= heart_rate <= 300):
+                _LOGGER.debug(
+                    "Implausible HR %d in record %d, skipping",
+                    heart_rate, i,
+                )
                 continue
 
             bp = BpResult(
@@ -560,52 +561,6 @@ def parse_bp_file(payload: bytes) -> list[BpResult]:
     return results
 
 
-def parse_battery(payload: bytes) -> tuple[int, int]:
-    """Parse GET_BATTERY (CMD 0x30) response.
-
-    Returns (battery_level_percent, battery_status).
-
-    LP-BP2W returns 4 bytes. Based on the Lepu SDK, the battery level
-    for BP2 devices is a 0-3 scale (0=0-25%, 1=25-50%, 2=50-75%, 3=75-100%).
-
-    However, the raw 4-byte response appears to contain additional data:
-      byte[0]: state/flags (0xCE observed)
-      byte[1]: unknown (0x0A observed)
-      byte[2-3]: voltage in mV (uint16 LE) — 0x0E83 = 3715 mV observed
-
-    We extract voltage (if available) and estimate percentage from it.
-    A typical Li-ion cell: 3.0V=0%, 3.3V=10%, 3.6V=50%, 3.8V=80%, 4.2V=100%.
-    """
-    level = 0
-    status = 0
-    try:
-        if len(payload) >= 4:
-            status = payload[0]
-            # Try voltage-based calculation from bytes 2-3
-            voltage_mv = struct.unpack_from("<H", payload, 2)[0]
-            _LOGGER.debug(
-                "Battery raw: %s, status=0x%02X, byte1=0x%02X, "
-                "voltage=%d mV",
-                payload.hex(),
-                status,
-                payload[1],
-                voltage_mv,
-            )
-            if 2500 <= voltage_mv <= 4300:
-                # Map voltage to percentage (Li-ion approximation)
-                # 3000mV = 0%, 4200mV = 100%
-                level = max(0, min(100, (voltage_mv - 3000) * 100 // 1200))
-            else:
-                # Voltage doesn't look right; fall back to byte[1]
-                level = payload[1]
-        elif len(payload) >= 2:
-            status = payload[0]
-            level = payload[1]
-    except Exception as e:
-        _LOGGER.warning("Failed to parse battery: %s", e)
-    return level, status
-
-
 # ---------------------------------------------------------------------------
 # Command builders (Protocol V2)
 # ---------------------------------------------------------------------------
@@ -639,14 +594,6 @@ def build_sync_time(now: time.struct_time | None = None) -> bytes:
     return LepuPacket(cmd=CMD_SYNC_TIME, payload=payload, seq=_next_seq()).encode()
 
 
-def build_get_info() -> bytes:
-    """Build LP-BP2W GET_INFO command (CMD 0x00).
-
-    Returns 40-byte device info with raw registers.
-    """
-    return LepuPacket(cmd=CMD_GET_INFO, seq=_next_seq()).encode()
-
-
 def build_get_device_info() -> bytes:
     """Build standard GET_DEVICE_INFO command (CMD 0xE1).
 
@@ -659,19 +606,6 @@ def build_get_device_info() -> bytes:
 def build_get_config() -> bytes:
     """Build GET_CONFIG command (CMD 0x06)."""
     return LepuPacket(cmd=CMD_GET_CONFIG, seq=_next_seq()).encode()
-
-
-def build_get_battery() -> bytes:
-    """Build GET_BATTERY command (CMD 0x30)."""
-    return LepuPacket(cmd=CMD_GET_BATTERY, seq=_next_seq()).encode()
-
-
-def build_read_file_list() -> bytes:
-    """Build READ_FILE_LIST command (CMD 0xF1).
-
-    Returns the list of files stored on the device.
-    """
-    return LepuPacket(cmd=CMD_READ_FILE_LIST, seq=_next_seq()).encode()
 
 
 def build_read_file_start(filename: str) -> bytes:
@@ -715,9 +649,18 @@ class PacketReassembler:
         self._buffer = bytearray()
         self.on_packet: Callable[[LepuPacket], None] | None = None
 
+    _MAX_BUFFER = 4096
+
     def feed(self, data: bytes) -> None:
         """Feed raw notification data. Complete packets are dispatched."""
         self._buffer.extend(data)
+        if len(self._buffer) > self._MAX_BUFFER:
+            _LOGGER.warning(
+                "Reassembler buffer overflow (%d bytes), clearing",
+                len(self._buffer),
+            )
+            self._buffer.clear()
+            return
         self._try_parse()
 
     def _try_parse(self) -> None:

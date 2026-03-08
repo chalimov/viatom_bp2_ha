@@ -288,6 +288,9 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         # BLE connection state
         self._current_client: BleakClient | None = None
         self._last_disconnect: float = 0  # monotonic timestamp
+        # Task tracking — prevent concurrent connections
+        self._monitor_task: asyncio.Task | None = None
+        self._reconnect_task: asyncio.Task | None = None
         # Per-command response events: cmd_byte → asyncio.Event
         self._pending_responses: dict[int, asyncio.Event] = {}
         # Device state polling (CMD 0x06 byte[0])
@@ -331,22 +334,59 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         )
         # Connect if:
         # 1. Not currently connected or connecting
-        # 2. At least 10 seconds since last disconnect (connection cooldown)
+        # 2. No active monitor/reconnect task running
+        # 3. At least 10 seconds since last disconnect (connection cooldown)
         if (
             not self._connected
             and not self._connecting
+            and not self._has_active_task()
             and now - self._last_disconnect > 10
         ):
             _LOGGER.info(
                 "Device %s is advertising — initiating connection",
                 self.address,
             )
-            self._connecting = True
-            self._entry.async_create_background_task(
-                self.hass,
-                self._connect_and_monitor(),
-                name=f"viatom_bp2_connect_{self.address}",
-            )
+            self._start_monitor()
+
+    # ------------------------------------------------------------------
+    # Task management — prevent concurrent connections
+    # ------------------------------------------------------------------
+    def _has_active_task(self) -> bool:
+        """Check if a monitor or reconnect task is still running."""
+        if self._monitor_task and not self._monitor_task.done():
+            return True
+        if self._reconnect_task and not self._reconnect_task.done():
+            return True
+        return False
+
+    def _cancel_reconnect(self) -> None:
+        """Cancel any pending reconnect task."""
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
+
+    def _start_monitor(self) -> None:
+        """Start a new _connect_and_monitor task, cancelling any existing."""
+        self._cancel_reconnect()
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+        self._connecting = True
+        self._monitor_task = self._entry.async_create_background_task(
+            self.hass,
+            self._connect_and_monitor(),
+            name=f"viatom_bp2_connect_{self.address}",
+        )
+
+    def _start_reconnect(self) -> None:
+        """Start a reconnect loop task (only if no active tasks)."""
+        if self._has_active_task():
+            _LOGGER.debug("Skipping reconnect — task already active")
+            return
+        self._reconnect_task = self._entry.async_create_background_task(
+            self.hass,
+            self._reconnect_loop(),
+            name=f"viatom_bp2_reconnect_{self.address}",
+        )
 
     # ------------------------------------------------------------------
     # Connect, housekeep, then enter poll loop
@@ -446,8 +486,10 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
 
         except BleakError as e:
             _LOGGER.warning("BLE error with BP2 at %s: %s", self.address, e)
+            self.last_update_success = False
         except Exception:
             _LOGGER.exception("Unexpected error with BP2 at %s", self.address)
+            self.last_update_success = False
         finally:
             if client is not None:
                 await self._disconnect(client)
@@ -459,11 +501,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             # fire again if the ESPHome proxy cached the device address. We
             # actively retry for up to 60s after disconnect to catch a device
             # that is still on (or turned back on quickly).
-            self._entry.async_create_background_task(
-                self.hass,
-                self._reconnect_loop(),
-                name=f"viatom_bp2_reconnect_{self.address}",
-            )
+            self._start_reconnect()
 
     # ------------------------------------------------------------------
     # Poll loop — CMD 0x06 every 5s, single-flag algorithm
@@ -482,6 +520,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         """
         idle_since: float | None = None
         consecutive_errors = 0
+        exited_after_fetch = False
 
         while client.is_connected:
             state = await self._poll_device_state(client)
@@ -533,6 +572,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                         )
                     self._new_data_pending = True
                     self.async_set_updated_data(self._data)
+                    exited_after_fetch = True
                     break
 
                 # _fetch_succeeded=True — just monitor
@@ -554,6 +594,12 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 break
 
             await asyncio.sleep(STATE_POLL_INTERVAL)
+
+        # Reset _fetch_succeeded if we exited due to idle timeout, connection
+        # loss, or errors (NOT after a fetch).  This ensures the next connection
+        # will fetch — the device may have new data we missed while disconnected.
+        if not exited_after_fetch:
+            self._fetch_succeeded = False
 
     async def _poll_device_state(self, client: BleakClient) -> int | None:
         """Send CMD 0x06 (GET_CONFIG) and extract device state from byte[0].
@@ -835,6 +881,13 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         elif packet.cmd == CMD_READ_FILE_END:
             _LOGGER.debug("File read complete ACK")
             self._last_fetch_new_count = 0
+            if self._file_data_buffer and self._file_size > 0:
+                if len(self._file_data_buffer) != self._file_size:
+                    _LOGGER.warning(
+                        "File size mismatch: expected %d, got %d bytes",
+                        self._file_size,
+                        len(self._file_data_buffer),
+                    )
             if self._file_data_buffer:
                 results = parse_bp_file(bytes(self._file_data_buffer))
                 _LOGGER.info("Parsed %d BP records from file", len(results))
@@ -872,17 +925,25 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
 
     async def _request_file_chunk(self, offset: int) -> None:
         """Request a file data chunk at the given offset."""
-        if self._current_client is not None:
-            await self._write_command(
-                self._current_client, build_read_file_data(offset)
-            )
+        try:
+            if self._current_client is not None:
+                await self._write_command(
+                    self._current_client, build_read_file_data(offset)
+                )
+        except Exception:
+            _LOGGER.warning("File chunk request failed at offset %d", offset)
+            self._all_files_done.set()
 
     async def _finish_file_read(self) -> None:
         """Send file read end command."""
-        if self._current_client is not None:
-            await self._write_command(
-                self._current_client, build_read_file_end()
-            )
+        try:
+            if self._current_client is not None:
+                await self._write_command(
+                    self._current_client, build_read_file_end()
+                )
+        except Exception:
+            _LOGGER.warning("File read end command failed")
+            self._all_files_done.set()
 
     # ------------------------------------------------------------------
     # Post-disconnect reconnection loop
@@ -930,12 +991,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                     attempt + 1,
                     max_attempts,
                 )
-                self._connecting = True
-                self._entry.async_create_background_task(
-                    self.hass,
-                    self._connect_and_monitor(),
-                    name=f"viatom_bp2_reconnect_connect_{self.address}",
-                )
+                self._start_monitor()
                 return
             else:
                 _LOGGER.debug(
@@ -954,6 +1010,18 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             self.address,
             max_attempts * interval,
         )
+
+    # ------------------------------------------------------------------
+    # Shutdown (integration unload)
+    # ------------------------------------------------------------------
+    async def async_shutdown(self) -> None:
+        """Clean up on integration unload — cancel tasks, disconnect BLE."""
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+        if self._current_client:
+            await self._disconnect(self._current_client)
 
     # ------------------------------------------------------------------
     # Disconnect
@@ -991,7 +1059,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         wasn't triggered (e.g., stable advertisements that HA doesn't
         report as changes).
         """
-        if not self._connected and not self._connecting:
+        if not self._connected and not self._connecting and not self._has_active_task():
             ble_device = bluetooth.async_ble_device_from_address(
                 self.hass, self.address, connectable=True
             )
@@ -1000,12 +1068,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                     "Periodic check: device %s is available, connecting",
                     self.address,
                 )
-                self._connecting = True
-                self._entry.async_create_background_task(
-                    self.hass,
-                    self._connect_and_monitor(),
-                    name=f"viatom_bp2_periodic_{self.address}",
-                )
+                self._start_monitor()
             else:
                 _LOGGER.debug(
                     "Periodic check: device %s not available", self.address

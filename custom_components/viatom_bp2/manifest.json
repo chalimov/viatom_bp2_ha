@@ -3,7 +3,8 @@
   "name": "Viatom BP2 Blood Pressure Monitor",
   "codeowners": ["@chalimov"],
   "config_flow": true,
-  "dependencies": ["bluetooth", "bluetooth_adapters"],
+  "dependencies": ["bluetooth"],
+  "homeassistant": "2025.1.0",
   "documentation": "https://github.com/chalimov/viatom_bp2_ha",
   "bluetooth": [
     {
