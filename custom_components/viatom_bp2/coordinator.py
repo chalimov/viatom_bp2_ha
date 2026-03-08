@@ -9,51 +9,28 @@ FIRMWARE QUIRK — FILE_START REJECTION ON FIRST CONNECTION:
   (after a clean disconnect) always succeeds.  Root cause unknown — the
   device may need a BLE session cycle before file transfer is ready.
 
-  Workaround: when FILE_START returns -1 (rejected), immediately
-  disconnect and fast-reconnect (3s).  The retry succeeds reliably.
-
 FIRMWARE LIMITATION — ONE TRANSFER PER CONNECTION:
   The LP-BP2W firmware allows only ONE FILE_START per BLE connection.
   A second FILE_START on the same connection returns byte[3]=0xe1.
-  The correct solution is disconnect-reconnect: the new connection's
-  FILE_START picks up any new records.
 
-Algorithm (validated by real-world ESPHome proxy testing):
+ALGORITHM — SINGLE FLAG (_fetch_succeeded):
+  Connect → housekeeping → poll loop.  One persistent flag controls
+  whether to fetch or just monitor:
 
-  PHASE 1 — CONNECTION + BASELINE FETCH
-    Advertisement seen → connect + subscribe → housekeeping (battery,
-    device info, time sync) → file fetch → enter poll loop.
-    If FILE_START is rejected (0xE1), immediately disconnect and
-    fast-reconnect — the retry always succeeds.
-    When reconnecting for new data (_new_data_pending), the baseline
-    fetch is SKIPPED — the poll loop will fetch when RESULT appears.
+    _fetch_succeeded=False (need data):
+      RESULT or IDLE → fetch → disconnect → reconnect
+        success → _fetch_succeeded=True
+        rejected → _fetch_succeeded stays False
 
-  PHASE 2 — POLL LOOP (CMD 0x06 every ~5s)
-    Uses _transfer_used to decide between in-connection fetch and
-    disconnect-reconnect:
+    _fetch_succeeded=True (have data, monitoring):
+      BUSY → _fetch_succeeded=False (new measurement started)
+      RESULT/IDLE → do nothing, just poll
+      IDLE 120s → disconnect (idle timeout)
 
-    State 4/15/16 (busy):
-      _transfer_used=True  → disconnect now (free slot for reconnect)
-      _transfer_used=False → stay connected, wait for RESULT
-
-    State 5/17 (result):
-      _transfer_used=True  → disconnect, fast-reconnect to fetch
-      _transfer_used=False → fetch in-connection (first transfer!)
-
-    State 3 (idle) after activity: same logic as RESULT
-
-    Disconnecting on MEASURING (when transfer slot is used) lets the
-    reconnect happen during the ~30s measurement.  The reconnected
-    session skips baseline fetch and waits for RESULT, then fetches
-    in-connection with zero delay.
-
-    On disconnect, _reconnect_loop fires with a fast 3s interval
-    (instead of the normal 15s) when _new_data_pending is True.
-
-  PHASE 3 — DISCONNECT + RECONNECT
-    Connection lost, idle timeout (120s), or new data pending →
-    disconnect, then reconnect loop re-establishes connection.
-    Fast reconnect (3s) when new data is pending.
+  First connection starts with _fetch_succeeded=False, so the first
+  IDLE triggers a fetch (the "baseline").  After every fetch attempt
+  we disconnect and reconnect (fast 3s via _new_data_pending).
+  This guarantees each connection's one transfer slot is fresh.
 
 SAFE commands (no screen change, invisible to user):
   CMD 0x00 (GET_INFO), 0x06 (GET_CONFIG), 0x30 (GET_BATTERY),
@@ -157,8 +134,7 @@ STATE_POLL_INTERVAL = 5
 # File download timeout (seconds) — generous for large files over BLE
 FILE_DOWNLOAD_TIMEOUT = 30.0
 
-# Disconnect after this many seconds of continuous idle (state 3)
-# with no measurement activity, after the baseline fetch is done.
+# Disconnect after this many seconds of continuous idle (state 3).
 # Frees the BLE proxy slot for other devices.
 IDLE_DISCONNECT_TIMEOUT = 120
 
@@ -319,13 +295,10 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         self._pending_responses: dict[int, asyncio.Event] = {}
         # Device state polling (CMD 0x06 byte[0])
         self._device_state: int | None = None  # last polled state
-        # Poll loop state machine
-        self._saw_activity = False  # seen any non-idle state since last fetch?
-        self._fetched_this_cycle = False  # already fetched for current activity?
-        self._prev_state: int | None = None  # previous poll state (for transition detection)
+        # Poll loop state machine — single flag algorithm
+        self._fetch_succeeded = False  # persists across connections
         self._last_fetch_new_count: int = 0  # result of last file download
-        self._new_data_pending = False  # new measurement detected, need reconnect to fetch
-        self._transfer_used = False  # True after file transfer (only 1 allowed per connection)
+        self._new_data_pending = False  # triggers fast 3s reconnect
 
     @property
     def bp_data(self) -> ViatomBP2Data:
@@ -379,22 +352,17 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             )
 
     # ------------------------------------------------------------------
-    # PHASE 1: Connect, housekeep, baseline fetch, then enter poll loop
+    # Connect, housekeep, then enter poll loop
     # ------------------------------------------------------------------
     async def _connect_and_monitor(self) -> None:
-        """Connect to BP2, run housekeeping, baseline fetch, then poll loop."""
-        # Reset per-connection state
-        fetching_new = self._new_data_pending
+        """Connect to BP2, run housekeeping, then poll loop."""
+        # Reset per-connection state (but NOT _fetch_succeeded — it persists)
         self._new_data_pending = False
         self._reassembler.reset()
         self._file_data_buffer.clear()
         self._file_size = 0
         self._file_offset = 0
         self._device_state = None
-        self._prev_state = None
-        self._saw_activity = False
-        self._fetched_this_cycle = False
-        self._transfer_used = False
 
         ble_device = bluetooth.async_ble_device_from_address(
             self.hass, self.address, connectable=True
@@ -466,51 +434,18 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             # Give CCCD write time to propagate through ESPHome proxy
             await asyncio.sleep(0.3)
 
-            # === PHASE 1: Housekeeping ===
-            _LOGGER.info("=== Phase 1: Housekeeping ===")
+            # === Housekeeping ===
+            _LOGGER.info("=== Housekeeping ===")
             await self._send_and_wait(client, build_get_battery(), timeout=3.0)
             await self._send_and_wait(client, build_get_device_info(), timeout=3.0)
             # Sync device clock using HA's configured timezone
             ha_now = dt_util.now().timetuple()
             await self._send_and_wait(client, build_sync_time(ha_now), timeout=3.0)
 
-            # === PHASE 1: File fetch ===
-            # Device firmware allows only ONE file transfer per connection.
-            # When reconnecting for new data (fetching_new), we SKIP the
-            # baseline fetch — the measurement is still in progress and
-            # the new record isn't on flash yet.  The poll loop will do
-            # the fetch when RESULT appears (using this connection's one
-            # transfer slot).
-            if fetching_new:
-                _LOGGER.info(
-                    "=== Phase 1: Skipping fetch (measurement in progress) — "
-                    "poll loop will fetch on RESULT ==="
-                )
-                self._saw_activity = True  # so poll loop knows we're mid-cycle
-            else:
-                _LOGGER.info("=== Phase 1: Baseline file fetch ===")
-                new_count = await self._fetch_bp_data(client)
-                if new_count == -1:
-                    # FILE_START rejected (0xE1) — device needs a fresh
-                    # BLE connection before file transfer works.
-                    # Disconnect immediately and fast-reconnect.
-                    _LOGGER.info(
-                        "Baseline fetch rejected — disconnecting for "
-                        "immediate reconnect"
-                    )
-                    self._new_data_pending = True
-                    self.async_set_updated_data(self._data)
-                    return
-                self._transfer_used = True
-                _LOGGER.info(
-                    "Fetch complete: %d new records (%d total known)",
-                    new_count,
-                    len(self._data._known_keys),
-                )
-            self.async_set_updated_data(self._data)
-
-            # === PHASE 2: State poll loop ===
-            _LOGGER.info("=== Phase 2: Entering state poll loop ===")
+            # === State poll loop ===
+            # No separate fetch phase — the poll loop handles everything
+            # via the single _fetch_succeeded flag.
+            _LOGGER.info("=== Entering state poll loop ===")
             await self._poll_loop(client)
 
         except BleakError as e:
@@ -535,33 +470,24 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             )
 
     # ------------------------------------------------------------------
-    # PHASE 2: Poll loop — CMD 0x06 every 5s, detect measurement activity
+    # Poll loop — CMD 0x06 every 5s, single-flag algorithm
     # ------------------------------------------------------------------
     async def _poll_loop(self, client: BleakClient) -> None:
         """Poll device state via CMD 0x06, handle measurement lifecycle.
 
-        The LP-BP2W firmware only allows ONE file transfer per BLE connection.
-        Behaviour depends on _transfer_used (whether this connection already
-        did a file transfer):
+        Single flag: _fetch_succeeded (persists across connections).
 
-        _transfer_used=True (baseline fetch was done):
-          BUSY    → disconnect now (free slot), reconnect will wait for RESULT
-          RESULT  → disconnect, fast-reconnect to fetch
-          IDLE after activity → same as RESULT
+          BUSY  → set _fetch_succeeded=False (new measurement started)
+          RESULT/IDLE when _fetch_succeeded=False → fetch → disconnect
+          RESULT/IDLE when _fetch_succeeded=True  → just monitor
+          IDLE 120s → disconnect (idle timeout)
 
-        _transfer_used=False (reconnected, slot available):
-          BUSY    → stay connected, wait for RESULT
-          RESULT  → fetch in-connection (first transfer!)
-          IDLE after activity → fetch in-connection
-
-        In both cases:
-          IDLE no activity → track idle duration for disconnect timeout
+        After every fetch attempt we disconnect and reconnect.
         """
-        idle_since: float | None = None  # monotonic time when idle streak started
+        idle_since: float | None = None
         consecutive_errors = 0
 
         while client.is_connected:
-            # Poll CMD 0x06 (GET_CONFIG) — byte[0] = device state
             state = await self._poll_device_state(client)
 
             if state is None:
@@ -577,110 +503,48 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             consecutive_errors = 0
             state_name = _STATE_NAMES.get(state, f"?({state})")
 
-            # Update diagnostic sensor with current state
             self._data.device_state_text = state_name
             self.async_set_updated_data(self._data)
 
-            # --- Track measurement activity ---
-            #
-            # Key rule: device allows only 1 file transfer per connection.
-            #   _transfer_used=True  → must disconnect-reconnect to fetch
-            #   _transfer_used=False → can fetch in-connection (first transfer)
-            #
             if state in DEVICE_STATES_BUSY:
                 idle_since = None
-                self._saw_activity = True
-                self._fetched_this_cycle = False
+                self._fetch_succeeded = False
+                _LOGGER.debug(
+                    "State %d (%s) — measurement in progress",
+                    state,
+                    state_name,
+                )
 
-                if self._transfer_used:
-                    # Already used our transfer slot (baseline fetch).
-                    # Disconnect now — reconnect will skip fetch and wait
-                    # for RESULT in poll loop, then fetch in-connection.
+            elif state in DEVICE_STATES_RESULT or state == DEVICE_STATE_IDLE:
+                if not self._fetch_succeeded:
                     _LOGGER.info(
-                        "State %d (%s) — measurement started, "
-                        "disconnecting to free transfer slot for reconnect",
+                        "State %d (%s) — fetching data",
                         state,
                         state_name,
                     )
+                    new_count = await self._fetch_bp_data(client)
+                    if new_count == -1:
+                        _LOGGER.info(
+                            "Fetch rejected — disconnecting for "
+                            "immediate reconnect"
+                        )
+                    else:
+                        self._fetch_succeeded = True
+                        _LOGGER.info(
+                            "Fetch complete: %d new records (%d total known)",
+                            new_count,
+                            len(self._data._known_keys),
+                        )
                     self._new_data_pending = True
+                    self.async_set_updated_data(self._data)
                     break
+
+                # _fetch_succeeded=True — just monitor
+                if state == DEVICE_STATE_IDLE:
+                    if idle_since is None:
+                        idle_since = time.monotonic()
                 else:
-                    # Fresh connection (reconnected for new data) — stay
-                    # connected and wait for RESULT to fetch in-connection.
-                    _LOGGER.debug(
-                        "State %d (%s) — measurement in progress "
-                        "(transfer slot available, waiting for result)",
-                        state,
-                        state_name,
-                    )
-
-            elif state in DEVICE_STATES_RESULT:
-                idle_since = None
-                if not self._fetched_this_cycle:
-                    if self._transfer_used:
-                        # Can't fetch — disconnect and reconnect
-                        _LOGGER.info(
-                            "State %d (%s) — result on screen, "
-                            "disconnecting to fetch via reconnect",
-                            state,
-                            state_name,
-                        )
-                        self._new_data_pending = True
-                        break
-                    else:
-                        # Transfer slot available — fetch in-connection!
-                        _LOGGER.info(
-                            "State %d (%s) — result on screen, "
-                            "fetching new data in-connection",
-                            state,
-                            state_name,
-                        )
-                        new_count = await self._fetch_bp_data(client)
-                        self._transfer_used = True
-                        _LOGGER.info(
-                            "Fetch complete: %d new records (%d total known)",
-                            new_count,
-                            len(self._data._known_keys),
-                        )
-                        self.async_set_updated_data(self._data)
-                        self._fetched_this_cycle = True
-                        self._saw_activity = False
-
-            elif state == DEVICE_STATE_IDLE:
-                if self._saw_activity and not self._fetched_this_cycle:
-                    if self._transfer_used:
-                        _LOGGER.info(
-                            "State 3 (IDLE) — missed RESULT window, "
-                            "disconnecting to fetch via reconnect"
-                        )
-                        self._new_data_pending = True
-                        break
-                    else:
-                        _LOGGER.info(
-                            "State 3 (IDLE) — missed RESULT window, "
-                            "fetching new data in-connection"
-                        )
-                        new_count = await self._fetch_bp_data(client)
-                        self._transfer_used = True
-                        _LOGGER.info(
-                            "Fetch complete: %d new records (%d total known)",
-                            new_count,
-                            len(self._data._known_keys),
-                        )
-                        self.async_set_updated_data(self._data)
-                        self._fetched_this_cycle = True
-                        self._saw_activity = False
-
-                # Reset cycle when returning to idle after a fetched result
-                if self._prev_state in DEVICE_STATES_RESULT and self._fetched_this_cycle:
-                    self._fetched_this_cycle = False
-                    self._saw_activity = False
-
-                # Track idle duration for disconnect timeout
-                if idle_since is None:
-                    idle_since = time.monotonic()
-
-            self._prev_state = state
+                    idle_since = None
 
             # --- Idle disconnect timeout ---
             if (
@@ -693,7 +557,6 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 )
                 break
 
-            # Wait for next poll
             await asyncio.sleep(STATE_POLL_INTERVAL)
 
     async def _poll_device_state(self, client: BleakClient) -> int | None:
@@ -716,14 +579,14 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         return self._device_state
 
     # ------------------------------------------------------------------
-    # File download helper — reusable for baseline and poll-triggered fetches
+    # File download helper — called by poll loop on RESULT/IDLE
     # ------------------------------------------------------------------
     async def _fetch_bp_data(self, client: BleakClient) -> int:
         """Download bp2nibp.list and ingest records.
 
-        This must be called only ONCE per BLE connection — the firmware
-        rejects a second FILE_START with byte[3]=0xe1 (error).
-        Called by _connect_and_monitor (baseline) or _poll_loop (on RESULT).
+        Called once per connection by the poll loop (on RESULT or IDLE
+        when _fetch_succeeded is False).  The firmware rejects a second
+        FILE_START on the same connection with byte[3]=0xe1.
 
         Returns:
           -1  if FILE_START was rejected (0xE1 error, empty payload)
@@ -1087,8 +950,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                     max_attempts,
                 )
 
-        # Clear the pending flag — if the device was off this whole time,
-        # the next connection should do a normal baseline fetch, not skip it.
+        # Clear the pending flag so the next connection uses normal interval.
         self._new_data_pending = False
 
         _LOGGER.info(
