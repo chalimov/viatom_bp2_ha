@@ -1,7 +1,10 @@
 """Data coordinator for Viatom BP2 Blood Pressure Monitor.
 
-Uses a persistent BLE connection with CMD 0x00 state polling to detect
-measurement activity and fetch results at the right time.
+Uses a persistent BLE connection with CMD 0x06 (GET_CONFIG) state polling
+to detect measurement activity and fetch results at the right time.
+
+NOTE: CMD 0x00 (GET_INFO) does NOT get responses through ESPHome BLE proxies.
+CMD 0x06 (GET_CONFIG) returns device state at byte[0] and works reliably.
 
 Algorithm (validated by direct BLE testing with bp2_counter_watch.py):
 
@@ -9,7 +12,7 @@ Algorithm (validated by direct BLE testing with bp2_counter_watch.py):
     Advertisement seen → connect + subscribe → housekeeping (battery,
     device info, time sync) → baseline file fetch → enter poll loop.
 
-  PHASE 2 — POLL LOOP (CMD 0x00 every ~5s)
+  PHASE 2 — POLL LOOP (CMD 0x06 every ~5s)
     Tracks two flags: saw_activity, fetched_this_cycle.
 
     State 4/15/16 (busy):  set saw_activity, wait
@@ -22,7 +25,7 @@ Algorithm (validated by direct BLE testing with bp2_counter_watch.py):
     no activity after baseline fetch) → disconnect, free BLE proxy slot.
 
 SAFE commands (no screen change, invisible to user):
-  CMD 0x00 (GET_INFO), 0x30 (GET_BATTERY), 0xE1 (GET_DEVICE_INFO),
+  CMD 0x06 (GET_CONFIG), 0x30 (GET_BATTERY), 0xE1 (GET_DEVICE_INFO),
   0xEC (SYNC_TIME), 0xF1 (READ_FILE_LIST)
 
 VISUAL commands (show brief transfer icon, auto-resolves on disconnect):
@@ -83,6 +86,7 @@ from .protocol import (
     PacketReassembler,
     LepuPacket,
     build_get_info,
+    build_get_config,
     build_get_device_info,
     build_sync_time,
     build_get_battery,
@@ -113,7 +117,7 @@ POST_CONNECT_DELAY = 2.0
 # Max subscribe retry attempts
 MAX_SUBSCRIBE_RETRIES = 3
 
-# How often to poll CMD 0x00 for device state (seconds).
+# How often to poll CMD 0x06 for device state (seconds).
 # 5s is fast enough to catch brief state-5/17 appearances,
 # slow enough to not spam the BLE link.
 STATE_POLL_INTERVAL = 5
@@ -153,6 +157,7 @@ class ViatomBP2Data:
         self.battery_status: int | None = None
         self.device_status: int | None = None
         self.device_info: DeviceInfo | None = None
+        self.device_state_text: str = "Disconnected"  # human-readable device state
         self.rssi: int | None = None
         self.last_update: float = 0
         self.measurements: list[BpResult] = []
@@ -241,7 +246,7 @@ class ViatomBP2Data:
 class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     """Coordinator for Viatom BP2 BLE data.
 
-    Uses persistent BLE connection with CMD 0x00 state polling to detect
+    Uses persistent BLE connection with CMD 0x06 state polling to detect
     measurements and fetch results. See module docstring for algorithm.
     """
 
@@ -280,7 +285,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         self._last_disconnect: float = 0  # monotonic timestamp
         # Per-command response events: cmd_byte → asyncio.Event
         self._pending_responses: dict[int, asyncio.Event] = {}
-        # Device state polling (CMD 0x00 byte[39])
+        # Device state polling (CMD 0x06 byte[0])
         self._device_state: int | None = None  # last polled state
         # Poll loop state machine
         self._saw_activity = False  # seen any non-idle state since last fetch?
@@ -365,6 +370,8 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         client: BleakClient | None = None
         try:
             _LOGGER.info("Connecting to BP2 at %s ...", self.address)
+            self._data.device_state_text = "Connecting"
+            self.async_set_updated_data(self._data)
 
             def _ble_device_callback():
                 return bluetooth.async_ble_device_from_address(
@@ -456,10 +463,10 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             self.async_set_updated_data(self._data)
 
     # ------------------------------------------------------------------
-    # PHASE 2: Poll loop — CMD 0x00 every 5s, state-based fetch triggers
+    # PHASE 2: Poll loop — CMD 0x06 every 5s, state-based fetch triggers
     # ------------------------------------------------------------------
     async def _poll_loop(self, client: BleakClient) -> None:
-        """Poll device state via CMD 0x00 and fetch BP data when appropriate.
+        """Poll device state via CMD 0x06 and fetch BP data when appropriate.
 
         Runs until the device disconnects or idle timeout is reached.
 
@@ -473,7 +480,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         consecutive_errors = 0
 
         while client.is_connected:
-            # Poll CMD 0x00
+            # Poll CMD 0x06 (GET_CONFIG) — byte[0] = device state
             state = await self._poll_device_state(client)
 
             if state is None:
@@ -488,6 +495,10 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
 
             consecutive_errors = 0
             state_name = _STATE_NAMES.get(state, f"?({state})")
+
+            # Update diagnostic sensor with current state
+            self._data.device_state_text = state_name
+            self.async_set_updated_data(self._data)
 
             # --- Track measurement activity ---
             if state in DEVICE_STATES_BUSY:
@@ -563,14 +574,18 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             await asyncio.sleep(STATE_POLL_INTERVAL)
 
     async def _poll_device_state(self, client: BleakClient) -> int | None:
-        """Send CMD 0x00 and extract device state from byte[39].
+        """Send CMD 0x06 (GET_CONFIG) and extract device state from byte[0].
+
+        CMD 0x00 (GET_INFO) does NOT get responses through ESPHome BLE proxies.
+        CMD 0x06 (GET_CONFIG) returns 9 bytes with device state at byte[0],
+        using the same state codes (3=IDLE, 4=MEASURING, 5=RESULT, etc.).
 
         Returns the state integer (3, 4, 5, 15, 16, 17) or None on failure.
         """
         self._device_state = None
 
         ok = await self._send_and_wait(
-            client, build_get_info(), timeout=3.0
+            client, build_get_config(), timeout=3.0
         )
         if not ok:
             return None
@@ -583,33 +598,64 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     async def _fetch_bp_data(self, client: BleakClient) -> int:
         """Download bp2nibp.list and ingest records.
 
+        Sends a cleanup FILE_END before FILE_START to clear any stale
+        transfer state from a previous connection. This fixes the issue
+        where FILE_START returns an empty payload on reconnection.
+
         Returns the number of NEW records found (after deduplication).
         """
-        self._file_data_buffer.clear()
-        self._file_size = 0
-        self._file_offset = 0
-        self._all_files_done.clear()
-
-        await self._write_command(
-            client, build_read_file_start(FILE_BP_LIST)
-        )
-
+        # Send cleanup FILE_END to clear any stale file transfer state.
+        # The device may have a lingering transfer from a previous connection
+        # that wasn't properly terminated. Without this, FILE_START returns
+        # an empty (0-byte) payload on second+ connections.
         try:
-            await asyncio.wait_for(
-                self._all_files_done.wait(), timeout=FILE_DOWNLOAD_TIMEOUT
-            )
-        except TimeoutError:
-            _LOGGER.warning(
-                "File download timed out after %.0fs — sending FILE_END cleanup",
-                FILE_DOWNLOAD_TIMEOUT,
-            )
-            # Send FILE_END to clean up device transfer state
-            try:
-                await self._write_command(client, build_read_file_end())
-            except BleakError:
-                pass
+            await self._write_command(client, build_read_file_end())
+            await asyncio.sleep(0.3)  # let device process the cleanup
+        except BleakError:
+            pass
+
+        # Attempt file download (with one retry on empty response)
+        for attempt in range(2):
             self._file_data_buffer.clear()
-            return 0
+            self._file_size = 0
+            self._file_offset = 0
+            self._all_files_done.clear()
+            self._last_fetch_new_count = 0
+
+            await self._write_command(
+                client, build_read_file_start(FILE_BP_LIST)
+            )
+
+            try:
+                await asyncio.wait_for(
+                    self._all_files_done.wait(), timeout=FILE_DOWNLOAD_TIMEOUT
+                )
+            except TimeoutError:
+                _LOGGER.warning(
+                    "File download timed out after %.0fs — sending FILE_END cleanup",
+                    FILE_DOWNLOAD_TIMEOUT,
+                )
+                try:
+                    await self._write_command(client, build_read_file_end())
+                except BleakError:
+                    pass
+                self._file_data_buffer.clear()
+                return 0
+
+            # If we got records, we're done
+            if self._last_fetch_new_count > 0 or self._file_size > 0:
+                return self._last_fetch_new_count
+
+            # Empty response on first attempt — retry once after cleanup
+            if attempt == 0:
+                _LOGGER.info(
+                    "FILE_START returned empty — retrying after FILE_END cleanup"
+                )
+                try:
+                    await self._write_command(client, build_read_file_end())
+                    await asyncio.sleep(0.5)
+                except BleakError:
+                    pass
 
         return self._last_fetch_new_count
 
@@ -728,9 +774,25 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 info.serial_number,
             )
 
-        # Config response (CMD 0x06 or CMD 0x33)
-        elif packet.cmd in (CMD_GET_CONFIG, CMD_GET_LP_CONFIG):
-            _LOGGER.debug("Config: %s", packet.payload.hex())
+        # Config response (CMD 0x06) — byte[0] = device state
+        # This is the primary state polling command (replaces CMD 0x00
+        # which does not get responses through ESPHome BLE proxies).
+        elif packet.cmd == CMD_GET_CONFIG:
+            if len(packet.payload) >= 1:
+                self._device_state = packet.payload[0]
+                state_name = _STATE_NAMES.get(self._device_state, "?")
+                _LOGGER.debug(
+                    "CMD 0x06 state: %d (%s), payload: %s",
+                    self._device_state,
+                    state_name,
+                    packet.payload.hex(),
+                )
+            else:
+                _LOGGER.debug("CMD 0x06 empty payload: %s", packet.payload.hex())
+
+        # LP config response (CMD 0x33)
+        elif packet.cmd == CMD_GET_LP_CONFIG:
+            _LOGGER.debug("LP Config: %s", packet.payload.hex())
 
         # Battery response (CMD 0x30)
         elif packet.cmd == CMD_GET_BATTERY:
@@ -880,7 +942,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         finally:
             self._connected = False
             self._last_disconnect = time.monotonic()
-            self.last_update_success = False
+            self._data.device_state_text = "Disconnected"
             _LOGGER.info("Disconnected from BP2 at %s", self.address)
 
     # ------------------------------------------------------------------

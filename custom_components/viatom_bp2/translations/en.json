@@ -59,6 +59,9 @@
       "irregular_heartbeat": {
         "name": "Irregular Heartbeat"
       },
+      "device_state": {
+        "name": "Device State"
+      },
       "user_id": {
         "name": "User"
       }

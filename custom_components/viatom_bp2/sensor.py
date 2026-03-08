@@ -101,6 +101,12 @@ SENSOR_DESCRIPTIONS: tuple[SensorEntityDescription, ...] = (
         entity_registry_enabled_default=False,
     ),
     SensorEntityDescription(
+        key="device_state_text",
+        translation_key="device_state",
+        icon="mdi:state-machine",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    SensorEntityDescription(
         key="user_id",
         translation_key="user_id",
         icon="mdi:account",
