@@ -125,6 +125,9 @@ STATE_POLL_INTERVAL = 5
 # File download timeout (seconds) — generous for large files over BLE
 FILE_DOWNLOAD_TIMEOUT = 30.0
 
+# Max retries for file fetch (FILE_START empty response through ESPHome proxy)
+MAX_FILE_FETCH_RETRIES = 3
+
 # Disconnect after this many seconds of continuous idle (state 3)
 # with no measurement activity, after the baseline fetch is done.
 # Frees the BLE proxy slot for other devices.
@@ -527,11 +530,11 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                     )
 
             elif state == DEVICE_STATE_IDLE:
-                # Check if user dismissed result before we saw state 5/17
+                # Fetch ONLY if we missed the RESULT window entirely
+                # (user dismissed result before we polled state 5/17)
                 if self._saw_activity and not self._fetched_this_cycle:
                     _LOGGER.info(
-                        "State 3 (IDLE) after activity — user dismissed "
-                        "result quickly, fetching data now"
+                        "State 3 (IDLE) — missed RESULT window, fetching data"
                     )
                     new_count = await self._fetch_bp_data(client)
                     self._fetched_this_cycle = True
@@ -598,24 +601,20 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     async def _fetch_bp_data(self, client: BleakClient) -> int:
         """Download bp2nibp.list and ingest records.
 
-        Sends a cleanup FILE_END before FILE_START to clear any stale
-        transfer state from a previous connection. This fixes the issue
-        where FILE_START returns an empty payload on reconnection.
+        NOTE: No cleanup FILE_END is sent before FILE_START. Sending FILE_END
+        before FILE_START through ESPHome proxies causes a timing collision
+        where the device processes FILE_END while we're already sending
+        FILE_START, corrupting the response buffer. Phase 1 always leaves
+        the device in a clean file transfer state, so no cleanup is needed.
 
         Returns the number of NEW records found (after deduplication).
         """
-        # Send cleanup FILE_END to clear any stale file transfer state.
-        # The device may have a lingering transfer from a previous connection
-        # that wasn't properly terminated. Without this, FILE_START returns
-        # an empty (0-byte) payload on second+ connections.
-        try:
-            await self._write_command(client, build_read_file_end())
-            await asyncio.sleep(0.3)  # let device process the cleanup
-        except BleakError:
-            pass
+        # Brief pause to let ESPHome proxy settle after CMD 0x06 polling.
+        # The proxy needs a moment between different command types.
+        await asyncio.sleep(0.5)
 
-        # Attempt file download (with one retry on empty response)
-        for attempt in range(2):
+        # Attempt file download with retries on empty response
+        for attempt in range(MAX_FILE_FETCH_RETRIES):
             self._file_data_buffer.clear()
             self._file_size = 0
             self._file_offset = 0
@@ -642,22 +641,22 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 self._file_data_buffer.clear()
                 return 0
 
-            # If we got records, we're done
+            # If we got records or a valid file size, we're done
             if self._last_fetch_new_count > 0 or self._file_size > 0:
                 return self._last_fetch_new_count
 
-            # Empty response on first attempt — retry once after cleanup
-            if attempt == 0:
-                _LOGGER.info(
-                    "FILE_START returned empty — retrying after FILE_END cleanup"
-                )
-                try:
-                    await self._write_command(client, build_read_file_end())
-                    await asyncio.sleep(0.5)
-                except BleakError:
-                    pass
+            # Empty response — retry after delay
+            _LOGGER.info(
+                "FILE_START returned empty (attempt %d/%d) — retrying",
+                attempt + 1,
+                MAX_FILE_FETCH_RETRIES,
+            )
+            await asyncio.sleep(1.0)
 
-        return self._last_fetch_new_count
+        _LOGGER.warning(
+            "FILE_START returned empty after %d attempts", MAX_FILE_FETCH_RETRIES
+        )
+        return 0
 
     # ------------------------------------------------------------------
     # Low-level BLE helpers
@@ -929,14 +928,19 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     # Disconnect
     # ------------------------------------------------------------------
     async def _disconnect(self, client: BleakClient) -> None:
-        """Disconnect from the BP2."""
+        """Disconnect from the BP2.
+
+        IMPORTANT: Always call client.disconnect() even if is_connected
+        returns False. When the device powers off, is_connected goes False
+        but the ESPHome BLE proxy may still hold the connection slot.
+        Calling disconnect() explicitly releases it for future connections.
+        """
         try:
-            if client.is_connected:
-                try:
-                    await client.stop_notify(NOTIFY_UUID)
-                except BleakError:
-                    pass
-                await client.disconnect()
+            try:
+                await client.stop_notify(NOTIFY_UUID)
+            except BleakError:
+                pass
+            await client.disconnect()
         except BleakError:
             pass
         finally:
