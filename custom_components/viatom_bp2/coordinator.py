@@ -3,36 +3,28 @@
 Uses a persistent BLE connection with CMD 0x06 (GET_CONFIG) state polling
 to detect measurement activity and fetch results via disconnect-reconnect.
 
-CMD 0x00 REQUIREMENT (proven by real-world testing):
-  CMD 0x00 (GET_INFO) must be sent as fire-and-forget before EVERY
-  FILE_START, including the very first one on a fresh connection.
-  Without it the device returns byte[3]=0xe1 (error) with an empty
-  payload.  The Windows BLE script sends CMD 0x00 every poll cycle,
-  so the device's file-transfer state machine is always initialised
-  when FILE_START arrives.  Through ESPHome proxies we use CMD 0x06
-  for polling (CMD 0x00 responses don't arrive through the proxy),
-  so CMD 0x00 is sent explicitly in _fetch_bp_data before each transfer.
+FIRMWARE QUIRK — FILE_START REJECTION ON FIRST CONNECTION:
+  The LP-BP2W often rejects FILE_START (CMD 0xF2) with byte[3]=0xE1 on
+  the very first BLE connection after device boot.  The second connection
+  (after a clean disconnect) always succeeds.  Root cause unknown — the
+  device may need a BLE session cycle before file transfer is ready.
 
-FIRMWARE LIMITATION (proven by exhaustive testing):
-  Despite the CMD 0x00 initialisation, the LP-BP2W firmware still only
-  allows ONE FILE_START per BLE connection.  A second FILE_START on the
-  same connection returns byte[3]=0xe1 regardless.  Approaches that ALL
-  failed to enable a second transfer (CMD 0x00 solves the first, not these):
-    1. Cleanup FILE_END via _send_and_wait before FILE_START
-    2. Additional CMD 0x00 between transfers
-    3. PacketReassembler buffer reset before FILE_START
-    4. Multiple retries with varying delays
+  Workaround: when FILE_START returns -1 (rejected), immediately
+  disconnect and fast-reconnect (3s).  The retry succeeds reliably.
 
-  The Windows BLE script (bp2_counter_watch.py) also only performs one
-  transfer per connection in normal usage — it disconnects after each
-  download.  The correct solution is disconnect-reconnect: the new
-  connection's CMD 0x00 + FILE_START picks up any new records.
+FIRMWARE LIMITATION — ONE TRANSFER PER CONNECTION:
+  The LP-BP2W firmware allows only ONE FILE_START per BLE connection.
+  A second FILE_START on the same connection returns byte[3]=0xe1.
+  The correct solution is disconnect-reconnect: the new connection's
+  FILE_START picks up any new records.
 
 Algorithm (validated by real-world ESPHome proxy testing):
 
   PHASE 1 — CONNECTION + BASELINE FETCH
     Advertisement seen → connect + subscribe → housekeeping (battery,
     device info, time sync) → file fetch → enter poll loop.
+    If FILE_START is rejected (0xE1), immediately disconnect and
+    fast-reconnect — the retry always succeeds.
     When reconnecting for new data (_new_data_pending), the baseline
     fetch is SKIPPED — the poll loop will fetch when RESULT appears.
 
@@ -126,7 +118,6 @@ from .protocol import (
     RtData,
     PacketReassembler,
     LepuPacket,
-    build_get_info,
     build_get_config,
     build_get_device_info,
     build_sync_time,
@@ -499,6 +490,17 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             else:
                 _LOGGER.info("=== Phase 1: Baseline file fetch ===")
                 new_count = await self._fetch_bp_data(client)
+                if new_count == -1:
+                    # FILE_START rejected (0xE1) — device needs a fresh
+                    # BLE connection before file transfer works.
+                    # Disconnect immediately and fast-reconnect.
+                    _LOGGER.info(
+                        "Baseline fetch rejected — disconnecting for "
+                        "immediate reconnect"
+                    )
+                    self._new_data_pending = True
+                    self.async_set_updated_data(self._data)
+                    return
                 self._transfer_used = True
                 _LOGGER.info(
                     "Fetch complete: %d new records (%d total known)",
@@ -719,31 +721,15 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     async def _fetch_bp_data(self, client: BleakClient) -> int:
         """Download bp2nibp.list and ingest records.
 
-        CMD 0x00 (GET_INFO) must be sent as fire-and-forget before every
-        FILE_START, even the first one on a fresh connection.  Without it
-        the device returns byte[3]=0xe1 (error) with an empty payload,
-        regardless of connection freshness.
-
-        The Windows BLE script sends CMD 0x00 every poll cycle, so the
-        device's file-transfer state machine is always initialised when
-        FILE_START arrives.  Through ESPHome proxies we use CMD 0x06 for
-        polling (CMD 0x00 responses don't arrive through the proxy), so we
-        send CMD 0x00 explicitly here before each transfer.
-
         This must be called only ONCE per BLE connection — the firmware
-        still rejects a second FILE_START even after another CMD 0x00.
+        rejects a second FILE_START with byte[3]=0xe1 (error).
         Called by _connect_and_monitor (baseline) or _poll_loop (on RESULT).
 
-        Returns the number of NEW records found (after deduplication).
+        Returns:
+          -1  if FILE_START was rejected (0xE1 error, empty payload)
+           0  if file was empty or timed out
+          >0  number of NEW records found (after deduplication)
         """
-        # Initialise device file-transfer state machine (required every time)
-        _LOGGER.debug("Sending CMD 0x00 (GET_INFO) to init file-transfer state")
-        await self._write_command(client, build_get_info())
-        await asyncio.sleep(1.0)  # allow device to process before FILE_START
-
-        # Clear any stale bytes that may have accumulated during the sleep
-        self._reassembler.reset()
-
         self._file_data_buffer.clear()
         self._file_size = 0
         self._file_offset = 0
@@ -957,10 +943,11 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                     self._all_files_done.set()
             else:
                 _LOGGER.warning(
-                    "Unexpected file start response: %s",
+                    "FILE_START rejected (0xE1 error, payload=%s) — "
+                    "device may need a reconnect before file transfer works",
                     packet.payload.hex(),
                 )
-                self._last_fetch_new_count = 0
+                self._last_fetch_new_count = -1
                 self._all_files_done.set()
 
         # File data response (CMD 0xF3) — contains chunked file data
