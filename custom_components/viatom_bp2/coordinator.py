@@ -57,8 +57,10 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-# How often the HA framework calls _async_update_data as a fallback
-RECONNECT_INTERVAL = timedelta(minutes=2)
+# How often the HA framework calls _async_update_data as a fallback.
+# 30s is fast enough to catch a device that powered on but whose
+# advertisements were missed by the bluetooth callback.
+RECONNECT_INTERVAL = timedelta(seconds=30)
 
 from .const import (
     DOMAIN,
@@ -464,6 +466,16 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             self._current_client = None
             self._connecting = False
             self.async_set_updated_data(self._data)
+
+            # Schedule reconnection attempts — the bluetooth callback may not
+            # fire again if the ESPHome proxy cached the device address. We
+            # actively retry for up to 60s after disconnect to catch a device
+            # that is still on (or turned back on quickly).
+            self._entry.async_create_background_task(
+                self.hass,
+                self._reconnect_loop(),
+                name=f"viatom_bp2_reconnect_{self.address}",
+            )
 
     # ------------------------------------------------------------------
     # PHASE 2: Poll loop — CMD 0x06 every 5s, state-based fetch triggers
@@ -933,6 +945,60 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             await self._write_command(
                 self._current_client, build_read_file_end()
             )
+
+    # ------------------------------------------------------------------
+    # Post-disconnect reconnection loop
+    # ------------------------------------------------------------------
+    async def _reconnect_loop(self) -> None:
+        """Actively try to reconnect after disconnect.
+
+        The HA bluetooth callback (handle_bluetooth_event) may not fire again
+        after disconnect — the ESPHome proxy can cache the device address and
+        HA may not report repeated identical advertisements as "changes".
+
+        This loop checks every 15s for up to 120s whether the device is
+        available, and initiates a connection if found.
+        """
+        _LOGGER.info("Starting reconnect loop for %s", self.address)
+        for attempt in range(8):  # 8 × 15s = 120s
+            await asyncio.sleep(15)
+
+            # Bail if someone else already connected
+            if self._connected or self._connecting:
+                _LOGGER.debug(
+                    "Reconnect loop: already %s, stopping",
+                    "connected" if self._connected else "connecting",
+                )
+                return
+
+            ble_device = bluetooth.async_ble_device_from_address(
+                self.hass, self.address, connectable=True
+            )
+            if ble_device is not None:
+                _LOGGER.info(
+                    "Reconnect loop: device %s available (attempt %d), connecting",
+                    self.address,
+                    attempt + 1,
+                )
+                self._connecting = True
+                self._entry.async_create_background_task(
+                    self.hass,
+                    self._connect_and_monitor(),
+                    name=f"viatom_bp2_reconnect_connect_{self.address}",
+                )
+                return
+            else:
+                _LOGGER.debug(
+                    "Reconnect loop: device %s not available (attempt %d/8)",
+                    self.address,
+                    attempt + 1,
+                )
+
+        _LOGGER.info(
+            "Reconnect loop: device %s not found after 120s, "
+            "relying on bluetooth callback and periodic check",
+            self.address,
+        )
 
     # ------------------------------------------------------------------
     # Disconnect
