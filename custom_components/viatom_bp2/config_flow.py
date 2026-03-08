@@ -61,7 +61,8 @@ class ViatomBP2ConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Confirm Bluetooth discovery."""
-        assert self._discovery_info is not None
+        if self._discovery_info is None:
+            return self.async_abort(reason="no_devices_found")
         if user_input is not None:
             return self.async_create_entry(
                 title=self._discovery_info.name or "Viatom BP2",
@@ -170,11 +171,14 @@ class ViatomBP2OptionsFlow(OptionsFlow):
 
         # Collect all known user IDs from the coordinator's data
         discovered_ids: set[int] = set()
-        coordinator = self._config_entry.runtime_data
-        if coordinator and hasattr(coordinator, "bp_data"):
-            for m in coordinator.bp_data.measurements:
-                if m.user_id:
-                    discovered_ids.add(m.user_id)
+        try:
+            coordinator = self._config_entry.runtime_data
+            if coordinator and hasattr(coordinator, "bp_data"):
+                for m in coordinator.bp_data.measurements:
+                    if m.user_id:
+                        discovered_ids.add(m.user_id)
+        except AttributeError:
+            pass  # Integration not loaded — no runtime_data available
 
         # Load existing names from options
         existing_names: dict[str, str] = self._config_entry.options.get(

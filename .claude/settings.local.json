@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''custom_components/viatom_bp2/coordinator.py'', doraise=True\\); print\\(''coordinator.py OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''custom_components/viatom_bp2/protocol.py'', doraise=True\\); print\\(''protocol.py OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''custom_components/viatom_bp2/config_flow.py'', doraise=True\\); print\\(''config_flow.py OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''custom_components/viatom_bp2/sensor.py'', doraise=True\\); print\\(''sensor.py OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''custom_components/viatom_bp2/__init__.py'', doraise=True\\); print\\(''__init__.py OK''\\)\")",
+      "Bash(python -c \":*)"
+    ]
+  }
+}

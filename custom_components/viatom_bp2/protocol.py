@@ -394,10 +394,6 @@ def parse_device_info(payload: bytes) -> DeviceInfo:
             .strip("\x00")
         )
 
-        # Bytes 24-30 contain the device's current clock (set by SYNC_TIME),
-        # NOT the firmware build date. We just use sw_major.sw_minor.
-        info.fw_version = f"{sw_major}.{sw_minor}"
-
         # Serial number: length at byte 37, string at bytes 38+
         if len(payload) >= 38:
             sn_len = payload[37]
@@ -617,16 +613,20 @@ _seq_counter = count(1)
 
 
 def _next_seq() -> int:
-    """Return the next sequence number (0-254, wrapping)."""
-    return next(_seq_counter) % 255
+    """Return the next sequence number (0-255, wrapping)."""
+    return next(_seq_counter) % 256
 
 
-def build_sync_time() -> bytes:
+def build_sync_time(now: time.struct_time | None = None) -> bytes:
     """Build SYNC_TIME command (CMD 0xEC).
 
     Payload: year(2 LE) + month(1) + day(1) + hour(1) + min(1) + sec(1)
+
+    Pass a struct_time in the user's local timezone. If None, falls back
+    to the system's local time (caller should prefer HA's dt_util.now()).
     """
-    now = time.localtime()
+    if now is None:
+        now = time.localtime()
     payload = struct.pack(
         "<HBBBBB",
         now.tm_year,
@@ -664,10 +664,6 @@ def build_get_config() -> bytes:
 def build_get_battery() -> bytes:
     """Build GET_BATTERY command (CMD 0x30)."""
     return LepuPacket(cmd=CMD_GET_BATTERY, seq=_next_seq()).encode()
-
-
-    # build_echo() REMOVED — CMD 0x0A is NOT echo on LP-BP2W!
-    # It starts a BP measurement (cuff inflates). Do NOT use.
 
 
 def build_read_file_list() -> bytes:

@@ -37,7 +37,7 @@ DANGEROUS — NEVER send on LP-BP2W:
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import struct
 import time
@@ -69,7 +69,6 @@ from .protocol import (
     CMD_GET_BATTERY,
     CMD_GET_CONFIG,
     CMD_SYNC_TIME,
-    CMD_READ_FILE_LIST,
     CMD_READ_FILE_START,
     CMD_READ_FILE_DATA,
     CMD_READ_FILE_END,
@@ -86,7 +85,6 @@ from .protocol import (
     build_get_info,
     build_get_device_info,
     build_sync_time,
-    build_get_config,
     build_get_battery,
     build_read_file_start,
     build_read_file_data,
@@ -171,9 +169,10 @@ class ViatomBP2Data:
         self.user_id = result.user_id
         self.irregular_heartbeat = result.irregular_heartbeat
         if result.timestamp > 0:
-            self.measurement_time = time.strftime(
-                "%Y-%m-%d %H:%M:%S", time.localtime(result.timestamp)
-            )
+            # Use HA timezone for consistent display
+            utc_dt = datetime.fromtimestamp(result.timestamp, tz=timezone.utc)
+            local_dt = dt_util.as_local(utc_dt)
+            self.measurement_time = local_dt.strftime("%Y-%m-%d %H:%M:%S")
         else:
             self.measurement_time = None
         self.last_update = time.monotonic()
@@ -219,9 +218,17 @@ class ViatomBP2Data:
                 self.measurements.append(r)
                 new_count += 1
 
-        # Trim to max
+        # Trim measurements and known_keys to prevent unbounded growth
         if len(self.measurements) > MAX_STORED_MEASUREMENTS:
             self.measurements = self.measurements[-MAX_STORED_MEASUREMENTS:]
+        max_known = MAX_STORED_MEASUREMENTS * 4
+        if len(self._known_keys) > max_known:
+            # Keep only keys for measurements still in the list
+            retained = {
+                (m.timestamp, m.systolic, m.diastolic, m.mean_arterial_pressure)
+                for m in self.measurements
+            }
+            self._known_keys = retained
 
         # Update "current" to newest record by timestamp
         if records:
@@ -271,10 +278,10 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         # BLE connection state
         self._current_client: BleakClient | None = None
         self._last_disconnect: float = 0  # monotonic timestamp
-        self._cmd_response = asyncio.Event()
+        # Per-command response events: cmd_byte → asyncio.Event
+        self._pending_responses: dict[int, asyncio.Event] = {}
         # Device state polling (CMD 0x00 byte[39])
         self._device_state: int | None = None  # last polled state
-        self._device_state_event = asyncio.Event()  # set when CMD 0x00 response arrives
         # Poll loop state machine
         self._saw_activity = False  # seen any non-idle state since last fetch?
         self._fetched_this_cycle = False  # already fetched for current activity?
@@ -374,6 +381,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             self._current_client = client
             self._connected = True
             self._connecting = False
+            self.last_update_success = True
             _LOGGER.info("Connected to BP2 at %s", self.address)
 
             # --- Post-connect stabilization ---
@@ -418,7 +426,9 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             _LOGGER.info("=== Phase 1: Housekeeping ===")
             await self._send_and_wait(client, build_get_battery(), timeout=3.0)
             await self._send_and_wait(client, build_get_device_info(), timeout=3.0)
-            await self._send_and_wait(client, build_sync_time(), timeout=3.0)
+            # Sync device clock using HA's configured timezone
+            ha_now = dt_util.now().timetuple()
+            await self._send_and_wait(client, build_sync_time(ha_now), timeout=3.0)
 
             # === PHASE 1: Baseline file fetch ===
             _LOGGER.info("=== Phase 1: Baseline file fetch ===")
@@ -557,22 +567,12 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
 
         Returns the state integer (3, 4, 5, 15, 16, 17) or None on failure.
         """
-        self._device_state_event.clear()
         self._device_state = None
 
-        try:
-            await self._write_command(client, build_get_info())
-        except BleakError as e:
-            _LOGGER.debug("Failed to send CMD 0x00: %s", e)
-            return None
-
-        # Wait for response (handler sets _device_state)
-        try:
-            await asyncio.wait_for(
-                self._device_state_event.wait(), timeout=3.0
-            )
-        except TimeoutError:
-            _LOGGER.debug("CMD 0x00 response timeout")
+        ok = await self._send_and_wait(
+            client, build_get_info(), timeout=3.0
+        )
+        if not ok:
             return None
 
         return self._device_state
@@ -600,18 +600,17 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             )
         except TimeoutError:
             _LOGGER.warning(
-                "File download timed out after %.0fs "
-                "(device may be busy — will retry)",
+                "File download timed out after %.0fs — sending FILE_END cleanup",
                 FILE_DOWNLOAD_TIMEOUT,
             )
+            # Send FILE_END to clean up device transfer state
+            try:
+                await self._write_command(client, build_read_file_end())
+            except BleakError:
+                pass
+            self._file_data_buffer.clear()
             return 0
 
-        # _all_files_done is set by _handle_packet when FILE_END arrives,
-        # which also parses and ingests the records. Check how many were new.
-        # We read the count from the last ingest via _data._known_keys size,
-        # but for simplicity, return from the ingest call in _handle_packet.
-        # Actually, _handle_packet already calls ingest_file_records.
-        # We need a way to get the count back. Use an instance variable.
         return self._last_fetch_new_count
 
     # ------------------------------------------------------------------
@@ -620,21 +619,22 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     async def _send_and_wait(
         self, client: BleakClient, data: bytes, timeout: float = 3.0
     ) -> bool:
-        """Send a command and wait for a response notification."""
-        self._cmd_response.clear()
-        await self._write_command(client, data)
+        """Send a command and wait for the matching response by command byte."""
+        # Extract the command byte from the Lepu packet (byte[1])
+        cmd_byte = data[1] if len(data) >= 2 else 0
+        event = asyncio.Event()
+        self._pending_responses[cmd_byte] = event
         try:
-            await asyncio.wait_for(
-                self._cmd_response.wait(), timeout=timeout
-            )
+            await self._write_command(client, data)
+            await asyncio.wait_for(event.wait(), timeout=timeout)
             return True
         except TimeoutError:
             _LOGGER.debug(
-                "No response for command %s within %.1fs",
-                data[:8].hex() if len(data) >= 8 else data.hex(),
-                timeout,
+                "No response for cmd 0x%02X within %.1fs", cmd_byte, timeout
             )
             return False
+        finally:
+            self._pending_responses.pop(cmd_byte, None)
 
     async def _write_command(self, client: BleakClient, data: bytes) -> None:
         """Write a command to the Lepu write characteristic."""
@@ -647,8 +647,11 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 WRITE_UUID[:12],
                 data.hex(),
             )
-        except BleakError:
-            # Fall back to write-without-response
+        except BleakError as first_err:
+            _LOGGER.debug(
+                "Write-with-response failed (%s), trying without response",
+                first_err,
+            )
             try:
                 await client.write_gatt_char(
                     WRITE_UUID, data, response=False
@@ -664,26 +667,36 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     def _notification_handler(
         self, _sender: Any, data: bytearray
     ) -> None:
-        """Handle raw BLE notification data from the Lepu notify char."""
+        """Handle raw BLE notification data from the Lepu notify char.
+
+        Called from the Bleak BLE thread — must use call_soon_threadsafe
+        for all event loop operations (asyncio.Event is not thread-safe).
+        """
         raw = bytes(data)
         _LOGGER.debug(
             "BLE notification (%d bytes): %s", len(raw), raw.hex()
         )
-        # Signal that we received a response
-        self._cmd_response.set()
         self.hass.loop.call_soon_threadsafe(self._reassembler.feed, raw)
 
     # ------------------------------------------------------------------
     # Packet handler — dispatches decoded Lepu protocol packets
     # ------------------------------------------------------------------
     def _handle_packet(self, packet: LepuPacket) -> None:
-        """Handle a decoded Lepu protocol V2 packet."""
+        """Handle a decoded Lepu protocol V2 packet.
+
+        Runs on the event loop (scheduled via call_soon_threadsafe).
+        """
         _LOGGER.debug(
             "Packet: cmd=0x%02X seq=%d payload_len=%d",
             packet.cmd,
             packet.seq,
             len(packet.payload),
         )
+
+        # Signal per-command response event (if anyone is waiting)
+        event = self._pending_responses.get(packet.cmd)
+        if event is not None:
+            event.set()
 
         # Sync time ACK (CMD 0xEC)
         if packet.cmd == CMD_SYNC_TIME:
@@ -702,7 +715,6 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 _LOGGER.debug(
                     "CMD 0x00 state: %d (%s)", self._device_state, state_name
                 )
-            self._device_state_event.set()
 
         # Standard device info (CMD 0xE1) — structured 60-byte response
         elif packet.cmd == CMD_GET_DEVICE_INFO:
@@ -868,6 +880,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         finally:
             self._connected = False
             self._last_disconnect = time.monotonic()
+            self.last_update_success = False
             _LOGGER.info("Disconnected from BP2 at %s", self.address)
 
     # ------------------------------------------------------------------

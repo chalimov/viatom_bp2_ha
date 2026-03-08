@@ -142,12 +142,12 @@ automation:
 
 ## Supported Devices
 
-| Device     | Status      | Notes                          |
-|------------|-------------|--------------------------------|
-| BP2        | 🔧 Expected | Same protocol as BP2A          |
-| BP2A       | 🔧 Expected | Primary development target     |
-| BP2W       | 🔧 Expected | WiFi variant, BLE still works  |
-| BP2 Connect| ❓ Unknown  | May use different firmware      |
+| Device     | Status         | Notes                          |
+|------------|----------------|--------------------------------|
+| LP-BP2W    | Tested         | Primary development device     |
+| BP2        | Untested       | Same Lepu protocol expected    |
+| BP2A       | Untested       | Same Lepu protocol expected    |
+| BP2 Connect| Unknown        | May use different firmware      |
 
 ## Credits
 

@@ -157,7 +157,7 @@ class ViatomBP2Sensor(CoordinatorEntity[ViatomBP2Coordinator], SensorEntity):
             data.device_info
             and data.device_info.fw_version
             and self._attr_device_info
-            and not self._attr_device_info.get("sw_version")
+            and not self._attr_device_info.get("sw_version")  # type: ignore[union-attr]
         ):
             self._attr_device_info = DeviceInfo(
                 identifiers={(DOMAIN, self.coordinator.address)},
