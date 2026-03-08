@@ -601,16 +601,25 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     async def _fetch_bp_data(self, client: BleakClient) -> int:
         """Download bp2nibp.list and ingest records.
 
-        NOTE: No cleanup FILE_END is sent before FILE_START. Sending FILE_END
-        before FILE_START through ESPHome proxies causes a timing collision
-        where the device processes FILE_END while we're already sending
-        FILE_START, corrupting the response buffer. Phase 1 always leaves
-        the device in a clean file transfer state, so no cleanup is needed.
+        Before starting a new file transfer, sends a cleanup FILE_END using
+        _send_and_wait to properly reset the device's file transfer state.
+        This is essential after a completed transfer (Phase 1 baseline or
+        previous Phase 2 fetch) — without it, the device responds to
+        FILE_START with 0xe1 "not ready" and an empty payload.
+
+        The cleanup FILE_END is synchronized via _send_and_wait (waits for
+        the device's FILE_END ACK) to avoid the timing collision that occurs
+        with raw _write_command + sleep through ESPHome proxies.
 
         Returns the number of NEW records found (after deduplication).
         """
-        # Brief pause to let ESPHome proxy settle after CMD 0x06 polling.
-        # The proxy needs a moment between different command types.
+        # Send cleanup FILE_END to reset any lingering file transfer state.
+        # Uses _send_and_wait to ensure the ACK is received before proceeding.
+        # If this times out (no prior transfer state to reset), that's fine.
+        _LOGGER.debug("Sending cleanup FILE_END to reset file transfer state")
+        await self._send_and_wait(client, build_read_file_end(), timeout=3.0)
+
+        # Additional settle time after FILE_END ACK for ESPHome proxy
         await asyncio.sleep(0.5)
 
         # Attempt file download with retries on empty response
@@ -645,13 +654,14 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             if self._last_fetch_new_count > 0 or self._file_size > 0:
                 return self._last_fetch_new_count
 
-            # Empty response — retry after delay
+            # Empty response — send FILE_END to reset state, then retry
             _LOGGER.info(
-                "FILE_START returned empty (attempt %d/%d) — retrying",
+                "FILE_START returned empty (attempt %d/%d) — sending FILE_END and retrying",
                 attempt + 1,
                 MAX_FILE_FETCH_RETRIES,
             )
-            await asyncio.sleep(1.0)
+            await self._send_and_wait(client, build_read_file_end(), timeout=3.0)
+            await asyncio.sleep(0.5)
 
         _LOGGER.warning(
             "FILE_START returned empty after %d attempts", MAX_FILE_FETCH_RETRIES
