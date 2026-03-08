@@ -79,7 +79,6 @@ from .protocol import (
     CMD_GET_INFO,
     CMD_GET_DEVICE_INFO,
     CMD_RT_DATA,
-    CMD_GET_BATTERY,
     CMD_GET_CONFIG,
     CMD_SYNC_TIME,
     CMD_READ_FILE_START,
@@ -98,7 +97,6 @@ from .protocol import (
     build_get_config,
     build_get_device_info,
     build_sync_time,
-    build_get_battery,
     build_read_file_start,
     build_read_file_data,
     build_read_file_end,
@@ -106,7 +104,6 @@ from .protocol import (
     parse_device_info_v1,
     parse_rt_data,
     parse_bp_file,
-    parse_battery,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -436,7 +433,6 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
 
             # === Housekeeping ===
             _LOGGER.info("=== Housekeeping ===")
-            await self._send_and_wait(client, build_get_battery(), timeout=3.0)
             await self._send_and_wait(client, build_get_device_info(), timeout=3.0)
             # Sync device clock using HA's configured timezone
             ha_now = dt_util.now().timetuple()
@@ -750,20 +746,19 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                     state_name,
                     packet.payload.hex(),
                 )
-            else:
+            # Battery from CMD 0x06: byte[1]=status, byte[2]=level (0-100%)
+            if len(packet.payload) >= 3:
+                bat_status = packet.payload[1]
+                bat_level = packet.payload[2]
+                if 0 <= bat_level <= 100:
+                    self._data.battery_level = bat_level
+                    self._data.battery_status = bat_status
+            if len(packet.payload) < 1:
                 _LOGGER.debug("CMD 0x06 empty payload: %s", packet.payload.hex())
 
         # LP config response (CMD 0x33)
         elif packet.cmd == CMD_GET_LP_CONFIG:
             _LOGGER.debug("LP Config: %s", packet.payload.hex())
-
-        # Battery response (CMD 0x30)
-        elif packet.cmd == CMD_GET_BATTERY:
-            level, status = parse_battery(packet.payload)
-            if level > 0:
-                self._data.battery_level = level
-                self._data.battery_status = status
-            _LOGGER.info("Battery: %d%% (status=%d)", level, status)
 
         # Real-time data (CMD 0x08) — pushed by device during measurement
         elif packet.cmd == CMD_RT_DATA:
