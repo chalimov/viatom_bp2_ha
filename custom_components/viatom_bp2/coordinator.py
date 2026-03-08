@@ -472,8 +472,14 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             await asyncio.sleep(0.3)
 
             # === Housekeeping ===
-            _LOGGER.info("=== Housekeeping ===")
-            await self._send_and_wait(client, build_get_device_info(), timeout=3.0)
+            # Skip device info on fast reconnects — we already have it
+            if self._data.device_info is None:
+                _LOGGER.info("=== Housekeeping ===")
+                await self._send_and_wait(
+                    client, build_get_device_info(), timeout=3.0
+                )
+            else:
+                _LOGGER.info("=== Housekeeping (quick) ===")
             # Sync device clock using HA's configured timezone
             ha_now = dt_util.now().timetuple()
             await self._send_and_wait(client, build_sync_time(ha_now), timeout=3.0)
@@ -496,6 +502,10 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             self._current_client = None
             self._connecting = False
             self.async_set_updated_data(self._data)
+
+            # Clear _monitor_task BEFORE starting reconnect, so
+            # _has_active_task() doesn't see the current (finishing) task.
+            self._monitor_task = None
 
             # Schedule reconnection attempts — the bluetooth callback may not
             # fire again if the ESPHome proxy cached the device address. We
@@ -570,12 +580,20 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                             new_count,
                             len(self._data._known_keys),
                         )
+                    # Always fast reconnect — firmware allows only one
+                    # FILE_START per connection, so we must reconnect to
+                    # be ready for the next measurement.
                     self._new_data_pending = True
                     self.async_set_updated_data(self._data)
                     exited_after_fetch = True
                     break
 
                 # _fetch_succeeded=True — just monitor
+                _LOGGER.debug(
+                    "State %d (%s) — already fetched, monitoring",
+                    state,
+                    state_name,
+                )
                 if state == DEVICE_STATE_IDLE:
                     if idle_since is None:
                         idle_since = time.monotonic()
