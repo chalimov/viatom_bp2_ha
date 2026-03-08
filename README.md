@@ -8,9 +8,11 @@ Works through **ESPHome Bluetooth Proxies** — no phone or ViHealth app needed.
 
 - **Auto-discovery** via BLE service UUID when BP2 powers on
 - **Local push** — no polling; reacts to BLE advertisements instantly
-- **Real-time results** — captures systolic/diastolic/pulse when measurement completes
+- **Real-time results** — captures systolic/diastolic/heart rate when measurement completes
 - **Stored readings** — downloads BP history files from device memory (up to 50 readings)
-- Exposes sensors: Systolic, Diastolic, Pulse, MAP, Battery, RSSI, Irregular Heartbeat flag
+- **Combined Blood Pressure sensor** — shows "125/82" format with measurement history attribute
+- Exposes sensors: Blood Pressure (combined), Systolic, Diastolic, Heart Rate, MAP, Pulse Pressure, Battery, RSSI, Irregular Heartbeat flag
+- **Persistent BLE connection** — stays connected with CMD 0x00 state polling to detect measurements without disturbing the user
 - **ESPHome BLE Proxy compatible** — works through ESP32 proxies placed near the monitor
 
 ## Requirements
@@ -42,19 +44,27 @@ Works through **ESPHome Bluetooth Proxies** — no phone or ViHealth app needed.
 
 ```
 BP2 powers on → BLE advertisement → ESPHome proxy → HA Bluetooth stack
-    → Integration detects advertisement
-    → Connects via BLE
-    → Syncs time
-    → Subscribes to notifications (real-time data)
-    → Requests stored file list
-    → Downloads BP measurement files
-    → Parses results → Updates HA sensors
-    → Disconnects
+
+PHASE 1 — Connection:
+    → Integration detects advertisement → connects via BLE
+    → Subscribes to notifications
+    → Housekeeping: battery, device info, time sync
+    → Baseline fetch: downloads BP measurement file → parses → updates sensors
+
+PHASE 2 — Monitoring (stays connected):
+    → Polls device state every 5s (CMD 0x00, invisible to user)
+    → Detects measurement activity (states 4/15/16 = busy, 5/17 = result)
+    → Downloads new records when measurement completes
+    → Handles single, triple, and back-to-back measurements
+
+PHASE 3 — Disconnect:
+    → After 120s idle with no measurement activity → disconnects
+    → Frees BLE proxy slot for other devices
+    → Reconnects automatically on next advertisement
 ```
 
-The BP2 is only BLE-active for a short window after powering on or completing a measurement.
-The integration uses the `local_push` pattern — it reacts to BLE advertisements rather than
-polling, which is both efficient and reliable with ESPHome proxies.
+The integration uses persistent BLE connections with state polling. This avoids the transfer
+icon flashing on the device screen and handles all measurement scenarios reliably.
 
 ## Protocol Details
 
@@ -117,17 +127,16 @@ automation:
   - alias: "Log Blood Pressure"
     trigger:
       - platform: state
-        entity_id: sensor.viatom_bp2_systolic
+        entity_id: sensor.viatom_bp2_blood_pressure
     condition:
-      - condition: numeric_state
-        entity_id: sensor.viatom_bp2_systolic
-        above: 0
+      - condition: template
+        value_template: "{{ states('sensor.viatom_bp2_systolic') | int > 0 }}"
     action:
       - service: notify.notify
         data:
           message: >
-            BP: {{ states('sensor.viatom_bp2_systolic') }}/{{ states('sensor.viatom_bp2_diastolic') }} mmHg
-            Pulse: {{ states('sensor.viatom_bp2_pulse') }} bpm
+            BP: {{ states('sensor.viatom_bp2_blood_pressure') }} mmHg
+            Heart Rate: {{ states('sensor.viatom_bp2_heart_rate') }} bpm
             Time: {{ states('sensor.viatom_bp2_last_measurement_time') }}
 ```
 

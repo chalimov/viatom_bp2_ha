@@ -1,0 +1,19 @@
+=== BP2 Advertisement Monitor v2 ===
+Started: 2026-03-08 09:42:15
+Target: 46:22:4E:7C:B4:D8
+Tracking fields: name, service_uuids, service_data, manufacturer_data, tx_power
+Excluded (noise): rssi, platform_data
+
+[09:42:20.825] === FIRST ADVERTISEMENT from 46:22:4E:7C:B4:D8 ===
+  Name:              LP-BP2W 0812
+  RSSI:              -58
+  Service UUIDs:     []
+  Service Data:      {}
+  Manufacturer Data: {'62286': '00'}
+  TX Power:          0
+
+[09:42:32.278] ... heartbeat (advert #30, RSSI=-65, mfr={'62286': '00'})
+[09:42:40.528] ... heartbeat (advert #60, RSSI=-62, mfr={'62286': '00'})
+[09:42:49.050] ... heartbeat (advert #90, RSSI=-63, mfr={'62286': '00'})
+[09:43:02.623] ... heartbeat (advert #120, RSSI=-53, mfr={'62286': '00'})
+[09:43:12.909] ... heartbeat (advert #150, RSSI=-50, mfr={'62286': '00'})

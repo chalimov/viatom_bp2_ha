@@ -1,14 +1,43 @@
 """Data coordinator for Viatom BP2 Blood Pressure Monitor.
 
-Follows the HA local_push pattern: listens for BLE advertisements,
-connects when the device is active, retrieves measurements, and
-disconnects. Works through ESPHome BLE proxies.
+Uses a persistent BLE connection with CMD 0x00 state polling to detect
+measurement activity and fetch results at the right time.
+
+Algorithm (validated by direct BLE testing with bp2_counter_watch.py):
+
+  PHASE 1 — CONNECTION
+    Advertisement seen → connect + subscribe → housekeeping (battery,
+    device info, time sync) → baseline file fetch → enter poll loop.
+
+  PHASE 2 — POLL LOOP (CMD 0x00 every ~5s)
+    Tracks two flags: saw_activity, fetched_this_cycle.
+
+    State 4/15/16 (busy):  set saw_activity, wait
+    State 5/17 (result):   fetch file if not fetched_this_cycle
+    State 3 (idle):        fetch file if saw_activity and not fetched_this_cycle
+    Transition 5/17→3:     reset both flags (ready for next cycle)
+
+  PHASE 3 — DISCONNECT
+    Connection lost, or idle timeout (120s of continuous state 3 with
+    no activity after baseline fetch) → disconnect, free BLE proxy slot.
+
+SAFE commands (no screen change, invisible to user):
+  CMD 0x00 (GET_INFO), 0x30 (GET_BATTERY), 0xE1 (GET_DEVICE_INFO),
+  0xEC (SYNC_TIME), 0xF1 (READ_FILE_LIST)
+
+VISUAL commands (show brief transfer icon, auto-resolves on disconnect):
+  0xF2 (READ_FILE_START), 0xF3 (READ_FILE_DATA), 0xF4 (READ_FILE_END)
+
+DANGEROUS — NEVER send on LP-BP2W:
+  0x04 (FACTORY_RESET), 0x09 (SWITCH_STATE / start measurement),
+  0x0A ("ECHO" = START_MEASUREMENT), 0x24/0x25 (inflate),
+  0x39 (inflate + disconnect), 0xE2 (DEVICE_RESET), 0xE3 (FACTORY_RESET_STD)
 """
 
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import timedelta
 import logging
 import struct
 import time
@@ -25,6 +54,9 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
+# How often the HA framework calls _async_update_data as a fallback
+RECONNECT_INTERVAL = timedelta(minutes=2)
+
 from .const import (
     DOMAIN,
     WRITE_UUID,
@@ -37,13 +69,15 @@ from .protocol import (
     CMD_GET_BATTERY,
     CMD_GET_CONFIG,
     CMD_SYNC_TIME,
-    CMD_ECHO,
     CMD_READ_FILE_LIST,
     CMD_READ_FILE_START,
     CMD_READ_FILE_DATA,
     CMD_READ_FILE_END,
     CMD_GET_LP_CONFIG,
     FILE_BP_LIST,
+    DEVICE_STATE_IDLE,
+    DEVICE_STATES_RESULT,
+    DEVICE_STATES_BUSY,
     BpResult,
     DeviceInfo,
     RtData,
@@ -54,7 +88,6 @@ from .protocol import (
     build_sync_time,
     build_get_config,
     build_get_battery,
-    build_echo,
     build_read_file_start,
     build_read_file_data,
     build_read_file_end,
@@ -73,6 +106,38 @@ MAX_STORED_MEASUREMENTS = 50
 # Maximum BLE connection retries
 MAX_CONNECT_RETRIES = 3
 
+# Post-connect stabilization delay (seconds).
+# GATT services need time to be discovered after the low-level connection.
+# ESPHome proxies also benefit from a brief stabilization window.
+# Validated via direct BLE testing: 2s is reliable, 1s causes drops.
+POST_CONNECT_DELAY = 2.0
+
+# Max subscribe retry attempts
+MAX_SUBSCRIBE_RETRIES = 3
+
+# How often to poll CMD 0x00 for device state (seconds).
+# 5s is fast enough to catch brief state-5/17 appearances,
+# slow enough to not spam the BLE link.
+STATE_POLL_INTERVAL = 5
+
+# File download timeout (seconds) — generous for large files over BLE
+FILE_DOWNLOAD_TIMEOUT = 30.0
+
+# Disconnect after this many seconds of continuous idle (state 3)
+# with no measurement activity, after the baseline fetch is done.
+# Frees the BLE proxy slot for other devices.
+IDLE_DISCONNECT_TIMEOUT = 120
+
+# State name map for logging
+_STATE_NAMES = {
+    3: "IDLE",
+    4: "MEASURING",
+    5: "RESULT",
+    15: "TRIPLE-MEAS",
+    16: "TRIPLE-PAUSE",
+    17: "TRIPLE-RESULT",
+}
+
 
 class ViatomBP2Data:
     """Container for the latest data from the BP2 device."""
@@ -80,10 +145,12 @@ class ViatomBP2Data:
     def __init__(self) -> None:
         self.systolic: int | None = None
         self.diastolic: int | None = None
-        self.pulse: int | None = None
-        self.mean_arterial_pressure: int | None = None
+        self.mean_arterial_pressure: int | None = None  # MAP (mmHg)
+        self.heart_rate: int | None = None  # HR (bpm) — shown on device screen
+        self.pulse_pressure: int | None = None  # PP = sys - dia (calculated)
+        self.user_id: int | None = None  # active user's Viatom cloud account ID
         self.irregular_heartbeat: bool = False
-        self.measurement_time: datetime | None = None
+        self.measurement_time: str | None = None  # ISO format string
         self.battery_level: int | None = None
         self.battery_status: int | None = None
         self.device_status: int | None = None
@@ -91,6 +158,25 @@ class ViatomBP2Data:
         self.rssi: int | None = None
         self.last_update: float = 0
         self.measurements: list[BpResult] = []
+        # Set of (timestamp, systolic, diastolic, map) to track known records
+        self._known_keys: set[tuple[int, int, int, int]] = set()
+
+    def update_from_bp_result(self, result: BpResult) -> None:
+        """Update from a stored BP file result (newest record)."""
+        self.systolic = result.systolic
+        self.diastolic = result.diastolic
+        self.mean_arterial_pressure = result.mean_arterial_pressure
+        self.heart_rate = result.heart_rate
+        self.pulse_pressure = result.pulse_pressure
+        self.user_id = result.user_id
+        self.irregular_heartbeat = result.irregular_heartbeat
+        if result.timestamp > 0:
+            self.measurement_time = time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(result.timestamp)
+            )
+        else:
+            self.measurement_time = None
+        self.last_update = time.monotonic()
 
     def update_from_rt(self, rt: RtData) -> bool:
         """Update from real-time data. Returns True if a new result is available."""
@@ -100,16 +186,18 @@ class ViatomBP2Data:
         if rt.result_ready and rt.systolic > 0:
             self.systolic = rt.systolic
             self.diastolic = rt.diastolic
-            self.pulse = rt.pulse
             self.mean_arterial_pressure = rt.mean_arterial_pressure
+            self.heart_rate = rt.heart_rate
+            self.pulse_pressure = rt.systolic - rt.diastolic
             now = dt_util.now()
-            self.measurement_time = now
+            self.measurement_time = now.isoformat()
             self.last_update = time.monotonic()
             result = BpResult(
                 systolic=rt.systolic,
                 diastolic=rt.diastolic,
-                pulse=rt.pulse,
                 mean_arterial_pressure=rt.mean_arterial_pressure,
+                heart_rate=rt.heart_rate,
+                pulse_pressure=rt.systolic - rt.diastolic,
                 timestamp=int(now.timestamp()),
             )
             self.measurements.append(result)
@@ -118,27 +206,37 @@ class ViatomBP2Data:
             return True
         return False
 
-    def update_from_bp_result(self, result: BpResult) -> None:
-        """Update from a stored BP file result."""
-        self.systolic = result.systolic
-        self.diastolic = result.diastolic
-        self.pulse = result.pulse
-        self.mean_arterial_pressure = result.mean_arterial_pressure
-        self.irregular_heartbeat = result.irregular_heartbeat
-        if result.timestamp > 0:
-            self.measurement_time = dt_util.as_local(
-                dt_util.utc_from_timestamp(result.timestamp)
-            )
-        else:
-            self.measurement_time = None
-        self.last_update = time.monotonic()
-        self.measurements.append(result)
+    def ingest_file_records(self, records: list[BpResult]) -> int:
+        """Ingest parsed BP records, deduplicating against known records.
+
+        Returns the number of new records added.
+        """
+        new_count = 0
+        for r in records:
+            key = (r.timestamp, r.systolic, r.diastolic, r.mean_arterial_pressure)
+            if key not in self._known_keys:
+                self._known_keys.add(key)
+                self.measurements.append(r)
+                new_count += 1
+
+        # Trim to max
         if len(self.measurements) > MAX_STORED_MEASUREMENTS:
             self.measurements = self.measurements[-MAX_STORED_MEASUREMENTS:]
 
+        # Update "current" to newest record by timestamp
+        if records:
+            newest = max(records, key=lambda r: r.timestamp)
+            self.update_from_bp_result(newest)
+
+        return new_count
+
 
 class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
-    """Coordinator for Viatom BP2 BLE data."""
+    """Coordinator for Viatom BP2 BLE data.
+
+    Uses persistent BLE connection with CMD 0x00 state polling to detect
+    measurements and fetch results. See module docstring for algorithm.
+    """
 
     def __init__(
         self,
@@ -146,67 +244,108 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         entry: ConfigEntry,
         address: str,
         name: str,
+        user_names: dict[int, str] | None = None,
     ) -> None:
         """Initialize the coordinator."""
         super().__init__(
             hass,
             _LOGGER,
             name=f"{DOMAIN}_{address}",
+            update_interval=RECONNECT_INTERVAL,
         )
         self.address = address
         self.device_name = name
+        self.user_names = user_names or {}  # user_id → friendly name
         self._entry = entry
         self._data = ViatomBP2Data()
         self._connected = False
         self._connecting = False
         self._reassembler = PacketReassembler()
         self._reassembler.on_packet = self._handle_packet
+        # File transfer state
         self._file_data_buffer = bytearray()
         self._file_size: int = 0
         self._file_offset: int = 0
-        self._got_result = asyncio.Event()
         self._all_files_done = asyncio.Event()
         self._all_files_done.set()
+        # BLE connection state
         self._current_client: BleakClient | None = None
         self._last_disconnect: float = 0  # monotonic timestamp
         self._cmd_response = asyncio.Event()
-        self._measuring = False  # True if device is actively taking a measurement
+        # Device state polling (CMD 0x00 byte[39])
+        self._device_state: int | None = None  # last polled state
+        self._device_state_event = asyncio.Event()  # set when CMD 0x00 response arrives
+        # Poll loop state machine
+        self._saw_activity = False  # seen any non-idle state since last fetch?
+        self._fetched_this_cycle = False  # already fetched for current activity?
+        self._prev_state: int | None = None  # previous poll state (for transition detection)
+        self._last_fetch_new_count: int = 0  # result of last file download
 
     @property
     def bp_data(self) -> ViatomBP2Data:
         """Return current data."""
         return self._data
 
+    # ------------------------------------------------------------------
+    # BLE advertisement handler — triggers connection
+    # ------------------------------------------------------------------
     @callback
     def handle_bluetooth_event(
         self,
         service_info: BluetoothServiceInfoBleak,
         change: bluetooth.BluetoothChange,
     ) -> None:
-        """Handle a BLE advertisement from the BP2."""
+        """Handle a BLE advertisement from the BP2.
+
+        Called by HA bluetooth when the device is seen advertising.
+        This means the device is awake (screen on). We connect and
+        stay connected, polling device state until idle timeout.
+        """
         self._data.rssi = service_info.rssi
+        now = time.monotonic()
         _LOGGER.debug(
-            "BLE advertisement from %s (RSSI: %s, change: %s)",
+            "BLE advertisement from %s (RSSI: %s, change: %s, "
+            "connected=%s, connecting=%s, since_disconnect=%.0fs)",
             self.address,
             service_info.rssi,
             change,
+            self._connected,
+            self._connecting,
+            now - self._last_disconnect if self._last_disconnect else 0,
         )
-        # Cooldown: avoid reconnecting within 5 seconds of last disconnect
+        # Connect if:
+        # 1. Not currently connected or connecting
+        # 2. At least 10 seconds since last disconnect (connection cooldown)
         if (
             not self._connected
             and not self._connecting
-            and time.monotonic() - self._last_disconnect > 5
+            and now - self._last_disconnect > 10
         ):
+            _LOGGER.info(
+                "Device %s is advertising — initiating connection",
+                self.address,
+            )
             self._connecting = True
             self._entry.async_create_background_task(
                 self.hass,
-                self._connect_and_fetch(),
+                self._connect_and_monitor(),
                 name=f"viatom_bp2_connect_{self.address}",
             )
 
-    async def _connect_and_fetch(self) -> None:
-        """Connect to the BP2, subscribe to notifications, and fetch data."""
-        self._got_result.clear()
+    # ------------------------------------------------------------------
+    # PHASE 1: Connect, housekeep, baseline fetch, then enter poll loop
+    # ------------------------------------------------------------------
+    async def _connect_and_monitor(self) -> None:
+        """Connect to BP2, run housekeeping, baseline fetch, then poll loop."""
+        # Reset per-connection state
+        self._reassembler.reset()
+        self._file_data_buffer.clear()
+        self._file_size = 0
+        self._file_offset = 0
+        self._device_state = None
+        self._prev_state = None
+        self._saw_activity = False
+        self._fetched_this_cycle = False
 
         ble_device = bluetooth.async_ble_device_from_address(
             self.hass, self.address, connectable=True
@@ -234,41 +373,66 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             )
             self._current_client = client
             self._connected = True
+            self._connecting = False
             _LOGGER.info("Connected to BP2 at %s", self.address)
 
-            # Log available services/characteristics for diagnostics
-            for service in client.services:
-                for char in service.characteristics:
-                    props = ",".join(char.properties)
-                    _LOGGER.debug(
-                        "  Char %s [%s] props=%s",
-                        char.uuid,
-                        char.handle,
-                        props,
-                    )
+            # --- Post-connect stabilization ---
+            await asyncio.sleep(POST_CONNECT_DELAY)
 
-            # Subscribe to Lepu notify characteristic (protocol responses)
-            try:
-                await client.start_notify(
-                    NOTIFY_UUID, self._notification_handler
-                )
-                _LOGGER.info(
-                    "Subscribed to Lepu notify char %s", NOTIFY_UUID[:12]
-                )
-            except BleakError as e:
-                _LOGGER.warning(
-                    "Failed to subscribe to Lepu notify %s: %s",
-                    NOTIFY_UUID[:12],
-                    e,
-                )
-                # If we can't subscribe to notifications, we can't communicate
+            # --- Subscribe to notifications with retry ---
+            subscribed = False
+            for attempt in range(MAX_SUBSCRIBE_RETRIES):
+                try:
+                    await client.start_notify(
+                        NOTIFY_UUID, self._notification_handler
+                    )
+                    subscribed = True
+                    _LOGGER.info(
+                        "Subscribed to Lepu notify char %s",
+                        NOTIFY_UUID[:12],
+                    )
+                    break
+                except BleakError as e:
+                    if attempt < MAX_SUBSCRIBE_RETRIES - 1:
+                        _LOGGER.warning(
+                            "Subscribe attempt %d/%d failed: %s, retrying...",
+                            attempt + 1,
+                            MAX_SUBSCRIBE_RETRIES,
+                            e,
+                        )
+                        await asyncio.sleep(1)
+                    else:
+                        _LOGGER.warning(
+                            "Failed to subscribe after %d attempts: %s",
+                            MAX_SUBSCRIBE_RETRIES,
+                            e,
+                        )
+
+            if not subscribed:
                 return
 
             # Give CCCD write time to propagate through ESPHome proxy
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
 
-            # === Run production init sequence ===
-            await self._run_init_sequence(client)
+            # === PHASE 1: Housekeeping ===
+            _LOGGER.info("=== Phase 1: Housekeeping ===")
+            await self._send_and_wait(client, build_get_battery(), timeout=3.0)
+            await self._send_and_wait(client, build_get_device_info(), timeout=3.0)
+            await self._send_and_wait(client, build_sync_time(), timeout=3.0)
+
+            # === PHASE 1: Baseline file fetch ===
+            _LOGGER.info("=== Phase 1: Baseline file fetch ===")
+            new_count = await self._fetch_bp_data(client)
+            _LOGGER.info(
+                "Baseline fetch complete: %d new records (%d total known)",
+                new_count,
+                len(self._data._known_keys),
+            )
+            self.async_set_updated_data(self._data)
+
+            # === PHASE 2: State poll loop ===
+            _LOGGER.info("=== Phase 2: Entering state poll loop ===")
+            await self._poll_loop(client)
 
         except BleakError as e:
             _LOGGER.warning("BLE error with BP2 at %s: %s", self.address, e)
@@ -281,86 +445,178 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             self._connecting = False
             self.async_set_updated_data(self._data)
 
-    async def _run_init_sequence(self, client: BleakClient) -> None:
-        """Production init sequence: GET_INFO → SYNC_TIME → fetch stored BP data.
+    # ------------------------------------------------------------------
+    # PHASE 2: Poll loop — CMD 0x00 every 5s, state-based fetch triggers
+    # ------------------------------------------------------------------
+    async def _poll_loop(self, client: BleakClient) -> None:
+        """Poll device state via CMD 0x00 and fetch BP data when appropriate.
 
-        Protocol verified working via direct BLE probe with CRC-8/CCITT.
-        Commands are written to WRITE_UUID (8b00ace7) with write-with-response.
-        Responses arrive on NOTIFY_UUID (0734594a).
+        Runs until the device disconnects or idle timeout is reached.
 
-        IMPORTANT: If the device is actively measuring BP, we do NOT send
-        file download commands (which would kill the measurement). Instead
-        we just wait for the real-time result to arrive.
+        State machine:
+          4/15/16 (busy)   → saw_activity = True, wait
+          5/17 (result)    → fetch if not fetched_this_cycle
+          3 (idle)         → fetch if saw_activity and not fetched_this_cycle
+          Transition 5/17→3 → reset flags (new cycle)
         """
-        _LOGGER.info("=== Starting BP2 init sequence ===")
+        idle_since: float | None = None  # monotonic time when idle streak started
+        consecutive_errors = 0
 
-        # Step 1: Echo/ping to verify communication
-        _LOGGER.debug("Step 1: Echo/ping")
-        await self._send_and_wait(client, build_echo(), timeout=3.0)
+        while client.is_connected:
+            # Poll CMD 0x00
+            state = await self._poll_device_state(client)
 
-        # Step 2: Get device info (standard CMD 0xE1 — structured response)
-        _LOGGER.debug("Step 2: GET_DEVICE_INFO (0xE1)")
-        await self._send_and_wait(client, build_get_device_info(), timeout=3.0)
+            if state is None:
+                consecutive_errors += 1
+                if consecutive_errors >= 3:
+                    _LOGGER.warning(
+                        "3 consecutive poll failures — connection may be lost"
+                    )
+                    break
+                await asyncio.sleep(STATE_POLL_INTERVAL)
+                continue
 
-        # Step 3: Get LP-BP2W info (CMD 0x00 — raw registers)
-        _LOGGER.debug("Step 3: GET_INFO (0x00)")
-        await self._send_and_wait(client, build_get_info(), timeout=3.0)
+            consecutive_errors = 0
+            state_name = _STATE_NAMES.get(state, f"?({state})")
 
-        # Step 4: Sync time
-        _LOGGER.debug("Step 4: SYNC_TIME")
-        await self._send_and_wait(client, build_sync_time(), timeout=3.0)
+            # --- Track measurement activity ---
+            if state in DEVICE_STATES_BUSY:
+                self._saw_activity = True
+                idle_since = None  # not idle
+                _LOGGER.debug("State %d (%s) — measurement in progress", state, state_name)
 
-        # Step 5: Get battery
-        _LOGGER.debug("Step 5: GET_BATTERY")
-        await self._send_and_wait(client, build_get_battery(), timeout=3.0)
+            elif state in DEVICE_STATES_RESULT:
+                self._saw_activity = True
+                idle_since = None  # not idle
+                if not self._fetched_this_cycle:
+                    _LOGGER.info(
+                        "State %d (%s) — result on screen, fetching data",
+                        state,
+                        state_name,
+                    )
+                    new_count = await self._fetch_bp_data(client)
+                    self._fetched_this_cycle = True
+                    self._saw_activity = False
+                    if new_count > 0:
+                        _LOGGER.info("Fetched %d new record(s)", new_count)
+                        self.async_set_updated_data(self._data)
+                else:
+                    _LOGGER.debug(
+                        "State %d (%s) — already fetched this cycle", state, state_name
+                    )
 
-        # Step 6: Check if the device is actively measuring.
-        # After the info/battery commands, the device may have pushed
-        # RT data (CMD 0x08) if a measurement is in progress. The
-        # _notification_handler sets self._measuring when it sees
-        # RT data with device_status == 0 (BP measuring).
-        #
-        # Also wait a moment for any queued RT notifications to arrive.
-        await asyncio.sleep(0.5)
+            elif state == DEVICE_STATE_IDLE:
+                # Check if user dismissed result before we saw state 5/17
+                if self._saw_activity and not self._fetched_this_cycle:
+                    _LOGGER.info(
+                        "State 3 (IDLE) after activity — user dismissed "
+                        "result quickly, fetching data now"
+                    )
+                    new_count = await self._fetch_bp_data(client)
+                    self._fetched_this_cycle = True
+                    self._saw_activity = False
+                    if new_count > 0:
+                        _LOGGER.info("Fetched %d new record(s)", new_count)
+                        self.async_set_updated_data(self._data)
 
-        if self._measuring:
-            # Device is actively measuring — do NOT send file commands.
-            # Wait for the measurement to complete (typically 30-60s).
-            _LOGGER.info(
-                "Device is measuring BP — waiting for result "
-                "(not downloading files to avoid interruption)"
-            )
-            try:
-                await asyncio.wait_for(
-                    self._got_result.wait(), timeout=90.0
+                # Track idle duration for disconnect timeout
+                if idle_since is None:
+                    idle_since = time.monotonic()
+
+            # --- Cycle reset: result → idle transition ---
+            if (
+                state == DEVICE_STATE_IDLE
+                and self._prev_state is not None
+                and self._prev_state in DEVICE_STATES_RESULT
+            ):
+                _LOGGER.debug(
+                    "Cycle reset: state %d→3 (result dismissed, ready for next)",
+                    self._prev_state,
                 )
-                _LOGGER.info("Got measurement result while device was active")
-            except TimeoutError:
-                _LOGGER.warning(
-                    "Measurement did not complete within 90s"
-                )
-        else:
-            # Device is idle — safe to download stored measurements.
-            _LOGGER.info("Step 6: Fetching stored BP measurements")
-            self._all_files_done.clear()
-            await self._write_command(
-                client, build_read_file_start(FILE_BP_LIST)
-            )
+                self._fetched_this_cycle = False
+                self._saw_activity = False
 
-            # Wait for file download to complete (or timeout)
-            try:
-                await asyncio.wait_for(
-                    self._all_files_done.wait(), timeout=30.0
-                )
+            self._prev_state = state
+
+            # --- Idle disconnect timeout ---
+            if (
+                idle_since is not None
+                and time.monotonic() - idle_since > IDLE_DISCONNECT_TIMEOUT
+            ):
                 _LOGGER.info(
-                    "File download complete, %d measurements loaded",
-                    len(self._data.measurements),
+                    "Idle for %ds — disconnecting to free BLE proxy slot",
+                    IDLE_DISCONNECT_TIMEOUT,
                 )
-            except TimeoutError:
-                _LOGGER.warning("File download timed out after 30s")
+                break
 
-        _LOGGER.info("=== BP2 init sequence complete ===")
+            # Wait for next poll
+            await asyncio.sleep(STATE_POLL_INTERVAL)
 
+    async def _poll_device_state(self, client: BleakClient) -> int | None:
+        """Send CMD 0x00 and extract device state from byte[39].
+
+        Returns the state integer (3, 4, 5, 15, 16, 17) or None on failure.
+        """
+        self._device_state_event.clear()
+        self._device_state = None
+
+        try:
+            await self._write_command(client, build_get_info())
+        except BleakError as e:
+            _LOGGER.debug("Failed to send CMD 0x00: %s", e)
+            return None
+
+        # Wait for response (handler sets _device_state)
+        try:
+            await asyncio.wait_for(
+                self._device_state_event.wait(), timeout=3.0
+            )
+        except TimeoutError:
+            _LOGGER.debug("CMD 0x00 response timeout")
+            return None
+
+        return self._device_state
+
+    # ------------------------------------------------------------------
+    # File download helper — reusable for baseline and poll-triggered fetches
+    # ------------------------------------------------------------------
+    async def _fetch_bp_data(self, client: BleakClient) -> int:
+        """Download bp2nibp.list and ingest records.
+
+        Returns the number of NEW records found (after deduplication).
+        """
+        self._file_data_buffer.clear()
+        self._file_size = 0
+        self._file_offset = 0
+        self._all_files_done.clear()
+
+        await self._write_command(
+            client, build_read_file_start(FILE_BP_LIST)
+        )
+
+        try:
+            await asyncio.wait_for(
+                self._all_files_done.wait(), timeout=FILE_DOWNLOAD_TIMEOUT
+            )
+        except TimeoutError:
+            _LOGGER.warning(
+                "File download timed out after %.0fs "
+                "(device may be busy — will retry)",
+                FILE_DOWNLOAD_TIMEOUT,
+            )
+            return 0
+
+        # _all_files_done is set by _handle_packet when FILE_END arrives,
+        # which also parses and ingests the records. Check how many were new.
+        # We read the count from the last ingest via _data._known_keys size,
+        # but for simplicity, return from the ingest call in _handle_packet.
+        # Actually, _handle_packet already calls ingest_file_records.
+        # We need a way to get the count back. Use an instance variable.
+        return self._last_fetch_new_count
+
+    # ------------------------------------------------------------------
+    # Low-level BLE helpers
+    # ------------------------------------------------------------------
     async def _send_and_wait(
         self, client: BleakClient, data: bytes, timeout: float = 3.0
     ) -> bool:
@@ -381,42 +637,34 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             return False
 
     async def _write_command(self, client: BleakClient, data: bytes) -> None:
-        """Write a command to the Lepu write characteristic.
-
-        Uses write-with-response (WRITE_REQ) — proven working in BLE probe.
-        The LP-BP2W's 8b00ace7 char supports both write and write-without-response.
-        """
-        if client.is_connected:
+        """Write a command to the Lepu write characteristic."""
+        if not client.is_connected:
+            return
+        try:
+            await client.write_gatt_char(WRITE_UUID, data, response=True)
+            _LOGGER.debug(
+                "Sent command on %s: %s",
+                WRITE_UUID[:12],
+                data.hex(),
+            )
+        except BleakError:
+            # Fall back to write-without-response
             try:
-                await client.write_gatt_char(WRITE_UUID, data, response=True)
+                await client.write_gatt_char(
+                    WRITE_UUID, data, response=False
+                )
                 _LOGGER.debug(
-                    "Sent command on %s: %s",
+                    "Sent command (no-resp) on %s: %s",
                     WRITE_UUID[:12],
                     data.hex(),
                 )
-            except BleakError:
-                # Fall back to write-without-response
-                try:
-                    await client.write_gatt_char(
-                        WRITE_UUID, data, response=False
-                    )
-                    _LOGGER.debug(
-                        "Sent command (no-resp) on %s: %s",
-                        WRITE_UUID[:12],
-                        data.hex(),
-                    )
-                except BleakError as e:
-                    _LOGGER.warning("Failed to write command: %s", e)
+            except BleakError as e:
+                _LOGGER.warning("Failed to write command: %s", e)
 
     def _notification_handler(
         self, _sender: Any, data: bytearray
     ) -> None:
-        """Handle raw BLE notification data from the Lepu notify char.
-
-        This callback may be invoked from a background thread (direct BT
-        adapters) or from the event loop (ESPHome proxies). We schedule
-        the actual processing on the event loop for thread safety.
-        """
+        """Handle raw BLE notification data from the Lepu notify char."""
         raw = bytes(data)
         _LOGGER.debug(
             "BLE notification (%d bytes): %s", len(raw), raw.hex()
@@ -425,6 +673,9 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         self._cmd_response.set()
         self.hass.loop.call_soon_threadsafe(self._reassembler.feed, raw)
 
+    # ------------------------------------------------------------------
+    # Packet handler — dispatches decoded Lepu protocol packets
+    # ------------------------------------------------------------------
     def _handle_packet(self, packet: LepuPacket) -> None:
         """Handle a decoded Lepu protocol V2 packet."""
         _LOGGER.debug(
@@ -439,14 +690,19 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             _LOGGER.info("Time sync acknowledged")
 
         # LP-BP2W device info (CMD 0x00) — raw 40-byte response
+        # Also contains device state at byte[39]
         elif packet.cmd == CMD_GET_INFO:
             info = parse_device_info_v1(packet.payload)
-            # Only update battery from this if we don't have it yet
             if info.battery_level > 0 and self._data.battery_level is None:
                 self._data.battery_level = info.battery_level
-            _LOGGER.info(
-                "LP-BP2W info (CMD 0x00): %d bytes", len(packet.payload)
-            )
+            # Extract device state from byte[39]
+            if len(packet.payload) >= 40:
+                self._device_state = packet.payload[39]
+                state_name = _STATE_NAMES.get(self._device_state, "?")
+                _LOGGER.debug(
+                    "CMD 0x00 state: %d (%s)", self._device_state, state_name
+                )
+            self._device_state_event.set()
 
         # Standard device info (CMD 0xE1) — structured 60-byte response
         elif packet.cmd == CMD_GET_DEVICE_INFO:
@@ -459,10 +715,6 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 info.model,
                 info.serial_number,
             )
-
-        # Echo ACK (CMD 0x0A) — empty response confirms communication
-        elif packet.cmd == CMD_ECHO:
-            _LOGGER.info("Echo/ping acknowledged — communication verified")
 
         # Config response (CMD 0x06 or CMD 0x33)
         elif packet.cmd in (CMD_GET_CONFIG, CMD_GET_LP_CONFIG):
@@ -481,23 +733,19 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             rt = parse_rt_data(packet.payload)
             self._data.battery_level = rt.battery_level
             self._data.device_status = rt.device_status
-
             if rt.measuring:
-                self._measuring = True
                 _LOGGER.debug(
-                    "Measuring... cuff pressure: %d", rt.cuff_pressure
+                    "RT_DATA: measuring, cuff pressure: %d", rt.cuff_pressure
                 )
-
             new_result = self._data.update_from_rt(rt)
             if new_result:
-                self._measuring = False  # measurement done
                 _LOGGER.info(
-                    "BP Result: %d/%d mmHg, pulse %d bpm",
+                    "RT_DATA result: %d/%d mmHg, MAP %d, HR %d bpm",
                     self._data.systolic,
                     self._data.diastolic,
-                    self._data.pulse,
+                    self._data.mean_arterial_pressure,
+                    self._data.heart_rate,
                 )
-                self._got_result.set()
 
         # File start response (CMD 0xF2) — returns file size
         elif packet.cmd == CMD_READ_FILE_START:
@@ -517,12 +765,14 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                     )
                 else:
                     _LOGGER.info("File is empty (0 bytes)")
+                    self._last_fetch_new_count = 0
                     self._all_files_done.set()
             else:
                 _LOGGER.warning(
                     "Unexpected file start response: %s",
                     packet.payload.hex(),
                 )
+                self._last_fetch_new_count = 0
                 self._all_files_done.set()
 
         # File data response (CMD 0xF3) — contains chunked file data
@@ -535,7 +785,6 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 len(self._file_data_buffer),
                 self._file_size,
             )
-            # Request next chunk if more data remains
             if self._file_offset < self._file_size:
                 self._entry.async_create_background_task(
                     self.hass,
@@ -543,7 +792,6 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                     name=f"viatom_bp2_file_{self.address}",
                 )
             else:
-                # File complete — request file end
                 self._entry.async_create_background_task(
                     self.hass,
                     self._finish_file_read(),
@@ -553,26 +801,32 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         # File end ACK (CMD 0xF4)
         elif packet.cmd == CMD_READ_FILE_END:
             _LOGGER.debug("File read complete ACK")
-            # Parse the accumulated file data
+            self._last_fetch_new_count = 0
             if self._file_data_buffer:
                 results = parse_bp_file(bytes(self._file_data_buffer))
                 _LOGGER.info("Parsed %d BP records from file", len(results))
                 if results:
-                    # Store all measurements
-                    self._data.measurements = results[
-                        -MAX_STORED_MEASUREMENTS:
-                    ]
-                    # Set "current" to the most recent by timestamp
-                    newest = max(results, key=lambda r: r.timestamp)
-                    self._data.update_from_bp_result(newest)
+                    new_count = self._data.ingest_file_records(results)
+                    self._last_fetch_new_count = new_count
                     _LOGGER.info(
-                        "Latest BP: %d/%d mmHg, pulse %d @ %s",
+                        "Ingested %d new records (%d total known)",
+                        new_count,
+                        len(self._data._known_keys),
+                    )
+                    user_ids = sorted(set(r.user_id for r in results if r.user_id))
+                    if user_ids:
+                        _LOGGER.info("User IDs in records: %s", user_ids)
+                    newest = max(results, key=lambda r: r.timestamp)
+                    _LOGGER.info(
+                        "Latest BP: %d/%d mmHg, MAP %d, HR %d, "
+                        "user %d @ %s",
                         newest.systolic,
                         newest.diastolic,
-                        newest.pulse,
+                        newest.mean_arterial_pressure,
+                        newest.heart_rate,
+                        newest.user_id,
                         newest.timestamp_str,
                     )
-                    self._got_result.set()
                 self._file_data_buffer.clear()
             self._all_files_done.set()
 
@@ -597,6 +851,9 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 self._current_client, build_read_file_end()
             )
 
+    # ------------------------------------------------------------------
+    # Disconnect
+    # ------------------------------------------------------------------
     async def _disconnect(self, client: BleakClient) -> None:
         """Disconnect from the BP2."""
         try:
@@ -613,6 +870,34 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             self._last_disconnect = time.monotonic()
             _LOGGER.info("Disconnected from BP2 at %s", self.address)
 
+    # ------------------------------------------------------------------
+    # HA DataUpdateCoordinator fallback
+    # ------------------------------------------------------------------
     async def _async_update_data(self) -> ViatomBP2Data:
-        """Return the latest data (called by HA coordinator)."""
+        """Periodic update — try to connect if device is available.
+
+        Called every RECONNECT_INTERVAL by the HA coordinator framework.
+        This catches cases where the bluetooth advertisement callback
+        wasn't triggered (e.g., stable advertisements that HA doesn't
+        report as changes).
+        """
+        if not self._connected and not self._connecting:
+            ble_device = bluetooth.async_ble_device_from_address(
+                self.hass, self.address, connectable=True
+            )
+            if ble_device is not None:
+                _LOGGER.info(
+                    "Periodic check: device %s is available, connecting",
+                    self.address,
+                )
+                self._connecting = True
+                self._entry.async_create_background_task(
+                    self.hass,
+                    self._connect_and_monitor(),
+                    name=f"viatom_bp2_periodic_{self.address}",
+                )
+            else:
+                _LOGGER.debug(
+                    "Periodic check: device %s not available", self.address
+                )
         return self._data

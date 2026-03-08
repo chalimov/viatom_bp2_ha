@@ -1,0 +1,305 @@
+BP2 New Record Detection
+Target: 46:22:4E:7C:B4:D8
+Time: 2026-03-08 12:30:05
+
+=== SNAPSHOT A (BEFORE) ===
+  0x00 GET_INFO: 10db11006ac21100d419000093db40053a68cd036d670301ea0403d7530300140000000000000003
+  0x06 GET_CONFIG: 030050850fc21100d4
+  0x08 RT_DATA: 030050850fc21100d4ff000093db40053a68cd036d670301ea0403d753030000
+  0x0D unknown_0D: 0000
+  0x26 GET_BLE_MAC: 01d8b47c4e2246
+  0x28 unknown_28: 01
+  0x30 GET_BATTERY: ce0a830e
+  0x32 RT_PRESSURE: 8c0a830e
+  0x33 GET_LP_CONFIG: 00020101
+  0xE1 GET_DEVICE_INFO: 420001010100000100333231323030313105000022860301ea0703080c1e030201000000000a32353233433030383132000000000000000000000000
+  0xF1 READ_FILE_LIST: 016270326e6962702e6c69737400000000
+
+=== SNAPSHOT B (AFTER) ===
+  0x00 GET_INFO: 6ac21100abe61100d419000093dbe66bad69cd036d670301ea0403d7530300140000000000000005
+  0x06 GET_CONFIG: 050050840fe61100d4
+  0x08 RT_DATA: 050050840fe61100d4010100007e004c006200400000c15d42000800000064008dd2cfd249d3d3d351d4bfd423d575d5abd5d2d5f9d52ed682d652d727daffe0bfec2bfca80bd9171b1f3c21391f701a22142f0d0c06fdfe6cf8d6f29deedceb53ea82e9ffe88ce8efe7fce69de5e7e30ae233e083de08ddc3dbc8da2fda02da3edab7da18db54db90dbd2db16dc51dc7bdc91dc8bdc5adc04dca1db75db00dccade94e54ef0fefcc3085111b61513165d13bb0e25092e0330fda0f7f1f272ef3ded2eecf4eb0eec0fecc1ebe8ea7ee9c7e701e654e4cbe276e16de0b7df4bdf19df21df57dfa4df
+  0x0D unknown_0D: 4e45
+  0x26 GET_BLE_MAC: 01d8b47c4e2246
+  0x28 unknown_28: 01
+  0x30 GET_BATTERY: ce0a830e
+  0x32 RT_PRESSURE: c20a830e
+  0x33 GET_LP_CONFIG: 00020101
+  0xE1 GET_DEVICE_INFO: 420001010100000100333231323030313105000022860301ea0703080c1f070201000000000a32353233433030383132000000000000000000000000
+  0xF1 READ_FILE_LIST: 016270326e6962702e6c69737400000000
+
+============================================================
+  DIFF: Snapshot A vs Snapshot B
+============================================================
+
+  0x00 GET_INFO             : *** CHANGED ***
+       byte[ 0]: 0x10 -> 0x6A  (diff: +90)
+       byte[ 1]: 0xDB -> 0xC2  (diff: -25)
+       byte[ 4]: 0x6A -> 0xAB  (diff: +65)
+       byte[ 5]: 0xC2 -> 0xE6  (diff: +36)
+       byte[14]: 0x40 -> 0xE6  (diff: +166)
+       byte[15]: 0x05 -> 0x6B  (diff: +102)
+       byte[16]: 0x3A -> 0xAD  (diff: +115)
+       byte[17]: 0x68 -> 0x69  (diff: +1)
+       byte[39]: 0x03 -> 0x05  (diff: +2)
+       A: 10db11006ac21100d419000093db40053a68cd036d670301ea0403d7530300140000000000000003
+       B: 6ac21100abe61100d419000093dbe66bad69cd036d670301ea0403d7530300140000000000000005
+       *** uint32 LE at offset 17: 1828965736 -> 1828965737 (incremented by 1!) ***
+
+  0x06 GET_CONFIG           : *** CHANGED ***
+       byte[ 0]: 0x03 -> 0x05  (diff: +2)
+       byte[ 3]: 0x85 -> 0x84  (diff: -1)
+       byte[ 5]: 0xC2 -> 0xE6  (diff: +36)
+       A: 030050850fc21100d4
+       B: 050050840fe61100d4
+
+  0x08 RT_DATA              : *** CHANGED ***
+       Size changed: 32 -> 232 bytes
+       byte[ 0]: 0x03 -> 0x05  (diff: +2)
+       byte[ 3]: 0x85 -> 0x84  (diff: -1)
+       byte[ 5]: 0xC2 -> 0xE6  (diff: +36)
+       byte[ 9]: 0xFF -> 0x01  (diff: -254)
+       byte[10]: 0x00 -> 0x01  (diff: +1)
+       byte[12]: 0x93 -> 0x00  (diff: -147)
+       byte[13]: 0xDB -> 0x7E  (diff: -93)
+       byte[14]: 0x40 -> 0x00  (diff: -64)
+       byte[15]: 0x05 -> 0x4C  (diff: +71)
+       byte[16]: 0x3A -> 0x00  (diff: -58)
+       byte[17]: 0x68 -> 0x62  (diff: -6)
+       byte[18]: 0xCD -> 0x00  (diff: -205)
+       byte[19]: 0x03 -> 0x40  (diff: +61)
+       byte[20]: 0x6D -> 0x00  (diff: -109)
+       byte[21]: 0x67 -> 0x00  (diff: -103)
+       byte[22]: 0x03 -> 0xC1  (diff: +190)
+       byte[23]: 0x01 -> 0x5D  (diff: +92)
+       byte[24]: 0xEA -> 0x42  (diff: -168)
+       byte[25]: 0x04 -> 0x00  (diff: -4)
+       byte[26]: 0x03 -> 0x08  (diff: +5)
+       byte[27]: 0xD7 -> 0x00  (diff: -215)
+       byte[28]: 0x53 -> 0x00  (diff: -83)
+       byte[29]: 0x03 -> 0x00  (diff: -3)
+       byte[30]: 0x00 -> 0x64  (diff: +100)
+       byte[32]: --- -> 0x8D
+       byte[33]: --- -> 0xD2
+       byte[34]: --- -> 0xCF
+       byte[35]: --- -> 0xD2
+       byte[36]: --- -> 0x49
+       byte[37]: --- -> 0xD3
+       byte[38]: --- -> 0xD3
+       byte[39]: --- -> 0xD3
+       byte[40]: --- -> 0x51
+       byte[41]: --- -> 0xD4
+       byte[42]: --- -> 0xBF
+       byte[43]: --- -> 0xD4
+       byte[44]: --- -> 0x23
+       byte[45]: --- -> 0xD5
+       byte[46]: --- -> 0x75
+       byte[47]: --- -> 0xD5
+       byte[48]: --- -> 0xAB
+       byte[49]: --- -> 0xD5
+       byte[50]: --- -> 0xD2
+       byte[51]: --- -> 0xD5
+       byte[52]: --- -> 0xF9
+       byte[53]: --- -> 0xD5
+       byte[54]: --- -> 0x2E
+       byte[55]: --- -> 0xD6
+       byte[56]: --- -> 0x82
+       byte[57]: --- -> 0xD6
+       byte[58]: --- -> 0x52
+       byte[59]: --- -> 0xD7
+       byte[60]: --- -> 0x27
+       byte[61]: --- -> 0xDA
+       byte[62]: --- -> 0xFF
+       byte[63]: --- -> 0xE0
+       byte[64]: --- -> 0xBF
+       byte[65]: --- -> 0xEC
+       byte[66]: --- -> 0x2B
+       byte[67]: --- -> 0xFC
+       byte[68]: --- -> 0xA8
+       byte[69]: --- -> 0x0B
+       byte[70]: --- -> 0xD9
+       byte[71]: --- -> 0x17
+       byte[72]: --- -> 0x1B
+       byte[73]: --- -> 0x1F
+       byte[74]: --- -> 0x3C
+       byte[75]: --- -> 0x21
+       byte[76]: --- -> 0x39
+       byte[77]: --- -> 0x1F
+       byte[78]: --- -> 0x70
+       byte[79]: --- -> 0x1A
+       byte[80]: --- -> 0x22
+       byte[81]: --- -> 0x14
+       byte[82]: --- -> 0x2F
+       byte[83]: --- -> 0x0D
+       byte[84]: --- -> 0x0C
+       byte[85]: --- -> 0x06
+       byte[86]: --- -> 0xFD
+       byte[87]: --- -> 0xFE
+       byte[88]: --- -> 0x6C
+       byte[89]: --- -> 0xF8
+       byte[90]: --- -> 0xD6
+       byte[91]: --- -> 0xF2
+       byte[92]: --- -> 0x9D
+       byte[93]: --- -> 0xEE
+       byte[94]: --- -> 0xDC
+       byte[95]: --- -> 0xEB
+       byte[96]: --- -> 0x53
+       byte[97]: --- -> 0xEA
+       byte[98]: --- -> 0x82
+       byte[99]: --- -> 0xE9
+       byte[100]: --- -> 0xFF
+       byte[101]: --- -> 0xE8
+       byte[102]: --- -> 0x8C
+       byte[103]: --- -> 0xE8
+       byte[104]: --- -> 0xEF
+       byte[105]: --- -> 0xE7
+       byte[106]: --- -> 0xFC
+       byte[107]: --- -> 0xE6
+       byte[108]: --- -> 0x9D
+       byte[109]: --- -> 0xE5
+       byte[110]: --- -> 0xE7
+       byte[111]: --- -> 0xE3
+       byte[112]: --- -> 0x0A
+       byte[113]: --- -> 0xE2
+       byte[114]: --- -> 0x33
+       byte[115]: --- -> 0xE0
+       byte[116]: --- -> 0x83
+       byte[117]: --- -> 0xDE
+       byte[118]: --- -> 0x08
+       byte[119]: --- -> 0xDD
+       byte[120]: --- -> 0xC3
+       byte[121]: --- -> 0xDB
+       byte[122]: --- -> 0xC8
+       byte[123]: --- -> 0xDA
+       byte[124]: --- -> 0x2F
+       byte[125]: --- -> 0xDA
+       byte[126]: --- -> 0x02
+       byte[127]: --- -> 0xDA
+       byte[128]: --- -> 0x3E
+       byte[129]: --- -> 0xDA
+       byte[130]: --- -> 0xB7
+       byte[131]: --- -> 0xDA
+       byte[132]: --- -> 0x18
+       byte[133]: --- -> 0xDB
+       byte[134]: --- -> 0x54
+       byte[135]: --- -> 0xDB
+       byte[136]: --- -> 0x90
+       byte[137]: --- -> 0xDB
+       byte[138]: --- -> 0xD2
+       byte[139]: --- -> 0xDB
+       byte[140]: --- -> 0x16
+       byte[141]: --- -> 0xDC
+       byte[142]: --- -> 0x51
+       byte[143]: --- -> 0xDC
+       byte[144]: --- -> 0x7B
+       byte[145]: --- -> 0xDC
+       byte[146]: --- -> 0x91
+       byte[147]: --- -> 0xDC
+       byte[148]: --- -> 0x8B
+       byte[149]: --- -> 0xDC
+       byte[150]: --- -> 0x5A
+       byte[151]: --- -> 0xDC
+       byte[152]: --- -> 0x04
+       byte[153]: --- -> 0xDC
+       byte[154]: --- -> 0xA1
+       byte[155]: --- -> 0xDB
+       byte[156]: --- -> 0x75
+       byte[157]: --- -> 0xDB
+       byte[158]: --- -> 0x00
+       byte[159]: --- -> 0xDC
+       byte[160]: --- -> 0xCA
+       byte[161]: --- -> 0xDE
+       byte[162]: --- -> 0x94
+       byte[163]: --- -> 0xE5
+       byte[164]: --- -> 0x4E
+       byte[165]: --- -> 0xF0
+       byte[166]: --- -> 0xFE
+       byte[167]: --- -> 0xFC
+       byte[168]: --- -> 0xC3
+       byte[169]: --- -> 0x08
+       byte[170]: --- -> 0x51
+       byte[171]: --- -> 0x11
+       byte[172]: --- -> 0xB6
+       byte[173]: --- -> 0x15
+       byte[174]: --- -> 0x13
+       byte[175]: --- -> 0x16
+       byte[176]: --- -> 0x5D
+       byte[177]: --- -> 0x13
+       byte[178]: --- -> 0xBB
+       byte[179]: --- -> 0x0E
+       byte[180]: --- -> 0x25
+       byte[181]: --- -> 0x09
+       byte[182]: --- -> 0x2E
+       byte[183]: --- -> 0x03
+       byte[184]: --- -> 0x30
+       byte[185]: --- -> 0xFD
+       byte[186]: --- -> 0xA0
+       byte[187]: --- -> 0xF7
+       byte[188]: --- -> 0xF1
+       byte[189]: --- -> 0xF2
+       byte[190]: --- -> 0x72
+       byte[191]: --- -> 0xEF
+       byte[192]: --- -> 0x3D
+       byte[193]: --- -> 0xED
+       byte[194]: --- -> 0x2E
+       byte[195]: --- -> 0xEC
+       byte[196]: --- -> 0xF4
+       byte[197]: --- -> 0xEB
+       byte[198]: --- -> 0x0E
+       byte[199]: --- -> 0xEC
+       byte[200]: --- -> 0x0F
+       byte[201]: --- -> 0xEC
+       byte[202]: --- -> 0xC1
+       byte[203]: --- -> 0xEB
+       byte[204]: --- -> 0xE8
+       byte[205]: --- -> 0xEA
+       byte[206]: --- -> 0x7E
+       byte[207]: --- -> 0xE9
+       byte[208]: --- -> 0xC7
+       byte[209]: --- -> 0xE7
+       byte[210]: --- -> 0x01
+       byte[211]: --- -> 0xE6
+       byte[212]: --- -> 0x54
+       byte[213]: --- -> 0xE4
+       byte[214]: --- -> 0xCB
+       byte[215]: --- -> 0xE2
+       byte[216]: --- -> 0x76
+       byte[217]: --- -> 0xE1
+       byte[218]: --- -> 0x6D
+       byte[219]: --- -> 0xE0
+       byte[220]: --- -> 0xB7
+       byte[221]: --- -> 0xDF
+       byte[222]: --- -> 0x4B
+       byte[223]: --- -> 0xDF
+       byte[224]: --- -> 0x19
+       byte[225]: --- -> 0xDF
+       byte[226]: --- -> 0x21
+       byte[227]: --- -> 0xDF
+       byte[228]: --- -> 0x57
+       byte[229]: --- -> 0xDF
+       byte[230]: --- -> 0xA4
+       byte[231]: --- -> 0xDF
+       A: 030050850fc21100d4ff000093db40053a68cd036d670301ea0403d753030000
+       B: 050050840fe61100d4010100007e004c006200400000c15d42000800000064008dd2cfd249d3d3d351d4bfd423d575d5abd5d2d5f9d52ed682d652d727daffe0bfec2bfca80bd9171b1f3c21391f701a22142f0d0c06fdfe6cf8d6f29deedceb53ea82e9ffe88ce8efe7fce69de5e7e30ae233e083de08ddc3dbc8da2fda02da3edab7da18db54db90dbd2db16dc51dc7bdc91dc8bdc5adc04dca1db75db00dccade94e54ef0fefcc3085111b61513165d13bb0e25092e0330fda0f7f1f272ef3ded2eecf4eb0eec0fecc1ebe8ea7ee9c7e701e654e4cbe276e16de0b7df4bdf19df21df57dfa4df
+
+  0x0D unknown_0D           : *** CHANGED ***
+       byte[ 0]: 0x00 -> 0x4E  (diff: +78)
+       byte[ 1]: 0x00 -> 0x45  (diff: +69)
+       A: 0000
+       B: 4e45
+  0x26 GET_BLE_MAC          : IDENTICAL (7 bytes)
+  0x28 unknown_28           : IDENTICAL (1 bytes)
+  0x30 GET_BATTERY          : IDENTICAL (4 bytes)
+
+  0x32 RT_PRESSURE          : *** CHANGED ***
+       byte[ 0]: 0x8C -> 0xC2  (diff: +54)
+       A: 8c0a830e
+       B: c20a830e
+  0x33 GET_LP_CONFIG        : IDENTICAL (4 bytes)
+
+  0xE1 GET_DEVICE_INFO      : *** CHANGED ***
+       byte[29]: 0x1E -> 0x1F  (diff: +1)
+       byte[30]: 0x03 -> 0x07  (diff: +4)
+       A: 420001010100000100333231323030313105000022860301ea0703080c1e030201000000000a32353233433030383132000000000000000000000000
+       B: 420001010100000100333231323030313105000022860301ea0703080c1f070201000000000a32353233433030383132000000000000000000000000
+  0xF1 READ_FILE_LIST       : IDENTICAL (17 bytes)

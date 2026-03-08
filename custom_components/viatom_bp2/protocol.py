@@ -94,9 +94,11 @@ class BpResult:
 
     systolic: int = 0
     diastolic: int = 0
-    pulse: int = 0
-    mean_arterial_pressure: int = 0
+    mean_arterial_pressure: int = 0  # MAP (mmHg) — SDK misleadingly labels "pulse"
+    heart_rate: int = 0  # HR (bpm) — shown on device screen
+    pulse_pressure: int = 0  # PP = systolic - diastolic (calculated, not stored)
     timestamp: int = 0  # unix seconds
+    user_id: int = 0  # multi-user support: identifies which user took measurement
     irregular_heartbeat: bool = False
 
     @property
@@ -149,8 +151,8 @@ class RtData:
     battery_level: int = 0
     systolic: int = 0
     diastolic: int = 0
-    pulse: int = 0
-    mean_arterial_pressure: int = 0
+    mean_arterial_pressure: int = 0  # MAP (mmHg)
+    heart_rate: int = 0  # HR (bpm) — SDK misleadingly labels "pulse"
     measuring: bool = False
     result_ready: bool = False
     cuff_pressure: int = 0
@@ -163,28 +165,35 @@ class RtData:
 #   1. LP-BP2W specific (from iffb.class in blepro AAR)
 #   2. Standard BP2 (from UniversalBleCmd.java in LepuBle)
 # Both verified working with direct BLE probe.
+#
+# SAFETY CLASSIFICATION (verified by direct device testing):
+#   SAFE    — device screen does not change, user is not disturbed
+#   VISUAL  — device shows a transfer icon, but auto-resolves on disconnect
+#   DANGER  — triggers cuff inflation (starts BP measurement!)
 # ---------------------------------------------------------------------------
 
 # LP-BP2W specific commands (from decompiled iffb.class)
-CMD_GET_INFO = 0x00           # LP-BP2W GET_INFO (returns 40-byte device info)
-CMD_FACTORY_RESET = 0x04
-CMD_GET_CONFIG = 0x06
-CMD_RT_DATA = 0x08            # Real-time data (BP measurement in progress)
-CMD_SWITCH_STATE = 0x09
-CMD_ECHO = 0x0A               # Echo / ping (returns empty ACK)
-CMD_GET_FILE_LIST = 0x11      # LP-BP2W file list
-CMD_LP_READ_FILE_START = 0x12 # LP-BP2W file read start
-CMD_LP_READ_FILE_DATA = 0x13  # LP-BP2W file read data
+CMD_GET_INFO = 0x00           # SAFE — LP-BP2W GET_INFO (returns 40-byte device info)
+CMD_FACTORY_RESET = 0x04      # DANGER — factory reset!
+CMD_GET_CONFIG = 0x06         # SAFE — returns device config
+CMD_RT_DATA = 0x08            # UNTESTED — real-time data (BP measurement in progress)
+# DANGER — DO NOT USE on LP-BP2W! These start a BP measurement (cuff inflates):
+CMD_SWITCH_STATE = 0x09       # DANGER — starts BP measurement on LP-BP2W!
+CMD_START_MEASUREMENT = 0x0A  # DANGER — starts BP measurement on LP-BP2W!
+# (0x0A was labeled "ECHO" in SDK decompilation but actually starts measurement)
+CMD_GET_FILE_LIST = 0x11      # UNTESTED — LP-BP2W file list
+CMD_LP_READ_FILE_START = 0x12 # UNTESTED — LP-BP2W file read start
+CMD_LP_READ_FILE_DATA = 0x13  # UNTESTED — LP-BP2W file read data
 
 # Standard BP2 commands (from UniversalBleCmd.java — also work on LP-BP2W)
-CMD_GET_DEVICE_INFO = 0xE1    # Standard GET_INFO (returns 60-byte info w/ serial)
-CMD_RESET = 0xE2
-CMD_FACTORY_RESET_STD = 0xE3
-CMD_SYNC_TIME = 0xEC          # Sync time
-CMD_READ_FILE_LIST = 0xF1     # Standard file list
-CMD_READ_FILE_START = 0xF2    # Standard file read start
-CMD_READ_FILE_DATA = 0xF3     # Standard file read data chunk
-CMD_READ_FILE_END = 0xF4      # Standard file read end
+CMD_GET_DEVICE_INFO = 0xE1    # SAFE — returns 60-byte info w/ serial
+CMD_RESET = 0xE2              # DANGER — device reset
+CMD_FACTORY_RESET_STD = 0xE3  # DANGER — factory reset
+CMD_SYNC_TIME = 0xEC          # SAFE — sync time
+CMD_READ_FILE_LIST = 0xF1     # SAFE — returns file names
+CMD_READ_FILE_START = 0xF2    # VISUAL — shows transfer icon, starts file read
+CMD_READ_FILE_DATA = 0xF3     # VISUAL — file data chunk (part of transfer)
+CMD_READ_FILE_END = 0xF4      # VISUAL — ends file transfer, icon disappears
 
 # Device status codes (from Bp2BleInterface.kt)
 STATUS_READY = 0
@@ -194,14 +203,39 @@ STATUS_ECG_MEASURING = 2
 STATUS_ECG_END = 3
 
 # Known filenames on the device
-FILE_USER_LIST = "user.list"
+# NOTE: user.list does NOT exist on LP-BP2W. Only these two files:
 FILE_BP_LIST = "bp2nibp.list"
+FILE_ECG_LIST = "bp2ecg.list"
 
-# Battery level constants from CMD 0x00 response
-CMD_GET_BATTERY = 0x30        # LP-BP2W battery command
-CMD_RT_STATE = 0x31
-CMD_RT_PRESSURE = 0x32
-CMD_GET_LP_CONFIG = 0x33      # LP-BP2W config
+# Additional safe commands (verified by direct BLE testing)
+CMD_GET_BATTERY = 0x30        # SAFE — 4 bytes: [status] [unknown] [voltage_lo] [voltage_hi]
+CMD_RT_STATE = 0x31           # SAFE but USELESS — returns random garbage each call
+CMD_RT_PRESSURE = 0x32        # SAFE — 4 bytes (real-time pressure)
+CMD_GET_LP_CONFIG = 0x33      # SAFE — 4 bytes
+
+# Additional danger commands discovered during full 0x00-0xFF scan
+CMD_DANGER_DEVICE_OFF = 0x24  # DANGER — device off + cuff inflation
+CMD_DANGER_INFLATE = 0x39     # DANGER — cuff inflation + BLE disconnect
+
+# ---------------------------------------------------------------------------
+# Device states (CMD 0x00 byte[39] / CMD 0x06 byte[0])
+#
+# Polling CMD 0x00 is SAFE — no screen change, no transfer icon.
+# This is the preferred method to detect new measurement results.
+#
+# Single measurement lifecycle:  3 -> 4 -> 5 -> 3
+# Triple measurement lifecycle:  3 -> 15 -> 16 -> 15 -> 16 -> 15 -> 17 -> 3
+# ---------------------------------------------------------------------------
+DEVICE_STATE_IDLE = 3            # Home screen, no measurement
+DEVICE_STATE_MEASURING = 4       # Single: cuff inflated, taking reading
+DEVICE_STATE_RESULT = 5          # Single: result on screen (until user dismisses)
+DEVICE_STATE_TRIPLE_MEAS = 15    # Triple: cuff inflated for one of 3 readings
+DEVICE_STATE_TRIPLE_PAUSE = 16   # Triple: rest between sequential readings
+DEVICE_STATE_TRIPLE_RESULT = 17  # Triple: averaged result on screen
+
+# Sets for logic
+DEVICE_STATES_RESULT = {DEVICE_STATE_RESULT, DEVICE_STATE_TRIPLE_RESULT}
+DEVICE_STATES_BUSY = {DEVICE_STATE_MEASURING, DEVICE_STATE_TRIPLE_MEAS, DEVICE_STATE_TRIPLE_PAUSE}
 
 
 # ---------------------------------------------------------------------------
@@ -401,8 +435,8 @@ def parse_rt_data(payload: bytes) -> RtData:
     For BP end (type 1):
       bytes 3-4: systolic (uint16 LE)
       bytes 5-6: diastolic (uint16 LE)
-      bytes 7-8: mean arterial pressure (uint16 LE)
-      bytes 9-10: pulse (uint16 LE)
+      bytes 7-8: MAP — mean arterial pressure (uint16 LE, mmHg)
+      bytes 9-10: HR — heart rate (uint16 LE, bpm) — SDK labels "pulse"
     """
     rt = RtData()
     try:
@@ -425,7 +459,7 @@ def parse_rt_data(payload: bytes) -> RtData:
             rt.systolic = struct.unpack_from("<H", payload, 3)[0]
             rt.diastolic = struct.unpack_from("<H", payload, 5)[0]
             rt.mean_arterial_pressure = struct.unpack_from("<H", payload, 7)[0]
-            rt.pulse = struct.unpack_from("<H", payload, 9)[0]
+            rt.heart_rate = struct.unpack_from("<H", payload, 9)[0]
 
     except Exception as e:
         _LOGGER.warning(
@@ -445,15 +479,17 @@ def parse_bp_file(payload: bytes) -> list[BpResult]:
 
     Record layout (37 bytes):
       [0-3]   timestamp (uint32 LE, unix seconds)
-      [4-7]   user_id (uint32 LE)
+      [4-7]   user_id (uint32 LE) — identifies which user took measurement
       [8]     status_flag (0x00 or 0x01)
       [9-12]  reserved (zeros)
       [13-14] systolic (uint16 LE, mmHg)
       [15-16] diastolic (uint16 LE, mmHg)
-      [17-18] pulse (uint16 LE, bpm)
-      [19-20] MAP (uint16 LE, mmHg)
+      [17-18] MAP — mean arterial pressure (uint16 LE, mmHg)
+              SDK misleadingly labels this "pulse"
+      [19-20] HR — heart rate (uint16 LE, bpm), shown on device screen
       [21-36] padding (zeros)
 
+    Pulse Pressure (PP = systolic - diastolic) is calculated, not stored.
     Records are stored in circular buffer order (not necessarily chronological).
     """
     HEADER_SIZE = 10
@@ -484,33 +520,37 @@ def parse_bp_file(payload: bytes) -> list[BpResult]:
                 break
 
             timestamp = struct.unpack_from("<I", rec, 0)[0]
-            # user_id = struct.unpack_from("<I", rec, 4)[0]
+            user_id = struct.unpack_from("<I", rec, 4)[0]
             status_flag = rec[8]
             systolic = struct.unpack_from("<H", rec, 13)[0]
             diastolic = struct.unpack_from("<H", rec, 15)[0]
-            pulse = struct.unpack_from("<H", rec, 17)[0]
-            map_val = struct.unpack_from("<H", rec, 19)[0]
+            map_val = struct.unpack_from("<H", rec, 17)[0]   # MAP (mmHg)
+            heart_rate = struct.unpack_from("<H", rec, 19)[0]  # HR (bpm)
 
             # Skip obviously invalid records (empty slots)
-            if systolic == 0 or diastolic == 0 or pulse == 0:
+            if systolic == 0 or diastolic == 0:
                 continue
 
             bp = BpResult(
                 systolic=systolic,
                 diastolic=diastolic,
-                pulse=pulse,
                 mean_arterial_pressure=map_val,
+                heart_rate=heart_rate,
+                pulse_pressure=systolic - diastolic,
                 timestamp=timestamp,
-                irregular_heartbeat=(status_flag == 0),
+                user_id=user_id,
+                irregular_heartbeat=(status_flag == 1),
             )
             results.append(bp)
             _LOGGER.debug(
-                "BP record %d: %d/%d pulse=%d MAP=%d ts=%s flag=%d",
+                "BP record %d: %d/%d MAP=%d HR=%d PP=%d user=%d ts=%s flag=%d",
                 i,
                 systolic,
                 diastolic,
-                pulse,
                 map_val,
+                heart_rate,
+                systolic - diastolic,
+                user_id,
                 bp.timestamp_str,
                 status_flag,
             )
@@ -527,12 +567,42 @@ def parse_bp_file(payload: bytes) -> list[BpResult]:
 def parse_battery(payload: bytes) -> tuple[int, int]:
     """Parse GET_BATTERY (CMD 0x30) response.
 
-    Returns (battery_level, battery_status).
+    Returns (battery_level_percent, battery_status).
+
+    LP-BP2W returns 4 bytes. Based on the Lepu SDK, the battery level
+    for BP2 devices is a 0-3 scale (0=0-25%, 1=25-50%, 2=50-75%, 3=75-100%).
+
+    However, the raw 4-byte response appears to contain additional data:
+      byte[0]: state/flags (0xCE observed)
+      byte[1]: unknown (0x0A observed)
+      byte[2-3]: voltage in mV (uint16 LE) — 0x0E83 = 3715 mV observed
+
+    We extract voltage (if available) and estimate percentage from it.
+    A typical Li-ion cell: 3.0V=0%, 3.3V=10%, 3.6V=50%, 3.8V=80%, 4.2V=100%.
     """
     level = 0
     status = 0
     try:
-        if len(payload) >= 2:
+        if len(payload) >= 4:
+            status = payload[0]
+            # Try voltage-based calculation from bytes 2-3
+            voltage_mv = struct.unpack_from("<H", payload, 2)[0]
+            _LOGGER.debug(
+                "Battery raw: %s, status=0x%02X, byte1=0x%02X, "
+                "voltage=%d mV",
+                payload.hex(),
+                status,
+                payload[1],
+                voltage_mv,
+            )
+            if 2500 <= voltage_mv <= 4300:
+                # Map voltage to percentage (Li-ion approximation)
+                # 3000mV = 0%, 4200mV = 100%
+                level = max(0, min(100, (voltage_mv - 3000) * 100 // 1200))
+            else:
+                # Voltage doesn't look right; fall back to byte[1]
+                level = payload[1]
+        elif len(payload) >= 2:
             status = payload[0]
             level = payload[1]
     except Exception as e:
@@ -596,9 +666,8 @@ def build_get_battery() -> bytes:
     return LepuPacket(cmd=CMD_GET_BATTERY, seq=_next_seq()).encode()
 
 
-def build_echo() -> bytes:
-    """Build ECHO/ping command (CMD 0x0A). Returns empty ACK."""
-    return LepuPacket(cmd=CMD_ECHO, seq=_next_seq()).encode()
+    # build_echo() REMOVED — CMD 0x0A is NOT echo on LP-BP2W!
+    # It starts a BP measurement (cuff inflates). Do NOT use.
 
 
 def build_read_file_list() -> bytes:

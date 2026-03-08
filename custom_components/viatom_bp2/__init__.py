@@ -5,6 +5,10 @@ via BLE (through ESPHome Bluetooth proxies or direct HA Bluetooth).
 
 Automatically detects the device when it becomes active after a
 measurement and retrieves BP readings.
+
+Multi-user support: the device stores records with Viatom cloud
+account IDs. Use the integration's Configure button to map discovered
+user IDs to friendly names.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, CONF_NAME, Platform
 from homeassistant.core import HomeAssistant
 
+from .const import DOMAIN, CONF_USER_NAMES
 from .coordinator import ViatomBP2Coordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -37,10 +42,24 @@ async def async_setup_entry(
     address: str = entry.data[CONF_ADDRESS]
     name: str = entry.data.get(CONF_NAME, "Viatom BP2")
 
-    coordinator = ViatomBP2Coordinator(hass, entry, address, name)
+    # Get user_names mapping from options (set via UI options flow)
+    user_names: dict[int, str] = {}
+    raw_names = entry.options.get(CONF_USER_NAMES, {})
+    for uid, uname in raw_names.items():
+        try:
+            user_names[int(uid)] = str(uname)
+        except (ValueError, TypeError):
+            pass
+
+    coordinator = ViatomBP2Coordinator(
+        hass, entry, address, name, user_names=user_names
+    )
 
     # Store coordinator in runtime_data (modern HA pattern, auto-cleaned on unload)
     entry.runtime_data = coordinator
+
+    # Listen for options updates (user changes name mapping)
+    entry.async_on_unload(entry.add_update_listener(_async_update_options))
 
     # Register for BLE advertisements matching the BP2
     entry.async_on_unload(
@@ -61,6 +80,13 @@ async def async_setup_entry(
         address,
     )
     return True
+
+
+async def _async_update_options(
+    hass: HomeAssistant, entry: ViatomBP2ConfigEntry
+) -> None:
+    """Handle options update — reload the integration to pick up new names."""
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(

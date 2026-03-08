@@ -22,7 +22,16 @@ from . import ViatomBP2ConfigEntry
 from .const import DOMAIN, MANUFACTURER
 from .coordinator import ViatomBP2Coordinator
 
+# Sensor order matters — HA shows entities in definition order.
+# Group: primary BP → vitals → status → timing → diagnostics
 SENSOR_DESCRIPTIONS: tuple[SensorEntityDescription, ...] = (
+    # --- Combined blood pressure (primary display sensor) ---
+    SensorEntityDescription(
+        key="blood_pressure",
+        translation_key="blood_pressure",
+        icon="mdi:heart-pulse",
+    ),
+    # --- Individual BP readings (for automations, graphs, history) ---
     SensorEntityDescription(
         key="systolic",
         translation_key="systolic",
@@ -37,26 +46,43 @@ SENSOR_DESCRIPTIONS: tuple[SensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:heart-pulse",
     ),
+    # --- Secondary vitals ---
     SensorEntityDescription(
-        key="pulse",
-        translation_key="pulse",
+        key="heart_rate",
+        translation_key="heart_rate",
         native_unit_of_measurement="bpm",
         state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:heart",
+        icon="mdi:heart-flash",
     ),
     SensorEntityDescription(
         key="mean_arterial_pressure",
         translation_key="mean_arterial_pressure",
         native_unit_of_measurement="mmHg",
         state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:heart-flash",
+        icon="mdi:heart",
+        entity_registry_enabled_default=False,
     ),
+    SensorEntityDescription(
+        key="pulse_pressure",
+        translation_key="pulse_pressure",
+        native_unit_of_measurement="mmHg",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:heart-outline",
+        entity_registry_enabled_default=False,
+    ),
+    # --- Status ---
+    SensorEntityDescription(
+        key="irregular_heartbeat",
+        translation_key="irregular_heartbeat",
+        icon="mdi:heart-broken",
+    ),
+    # --- Timing ---
     SensorEntityDescription(
         key="measurement_time",
         translation_key="measurement_time",
-        device_class=SensorDeviceClass.TIMESTAMP,
         icon="mdi:clock-outline",
     ),
+    # --- Diagnostics (hidden by default in HA UI) ---
     SensorEntityDescription(
         key="battery_level",
         translation_key="battery_level",
@@ -75,9 +101,11 @@ SENSOR_DESCRIPTIONS: tuple[SensorEntityDescription, ...] = (
         entity_registry_enabled_default=False,
     ),
     SensorEntityDescription(
-        key="irregular_heartbeat",
-        translation_key="irregular_heartbeat",
-        icon="mdi:heart-broken",
+        key="user_id",
+        translation_key="user_id",
+        icon="mdi:account",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
     ),
 )
 
@@ -140,32 +168,47 @@ class ViatomBP2Sensor(CoordinatorEntity[ViatomBP2Coordinator], SensorEntity):
                 hw_version=data.device_info.hw_version or None,
             )
 
-        if key == "irregular_heartbeat":
+        if key == "blood_pressure":
+            # Combined sys/dia display: "125/82"
+            if data.systolic is not None and data.diastolic is not None:
+                self._attr_native_value = f"{data.systolic}/{data.diastolic}"
+            # Attach measurement history as extra state attributes
+            if data.measurements:
+                self._attr_extra_state_attributes = {
+                    "history": [
+                        {
+                            "bp": f"{m.systolic}/{m.diastolic}",
+                            "hr": m.heart_rate,
+                            "map": m.mean_arterial_pressure,
+                            "pp": m.pulse_pressure,
+                            "irregular": m.irregular_heartbeat,
+                            "time": m.timestamp_str,
+                        }
+                        for m in data.measurements[-10:]  # last 10
+                    ]
+                }
+        elif key == "irregular_heartbeat":
             # Only show after a measurement has been taken; display as
             # human-readable string since SensorEntity doesn't support bool
             if data.measurements:
                 self._attr_native_value = (
                     "Detected" if data.irregular_heartbeat else "Normal"
                 )
+        elif key == "user_id":
+            # Show the active user's name (from config) or raw cloud ID
+            if data.user_id is not None:
+                user_names = self.coordinator.user_names
+                if data.user_id in user_names:
+                    self._attr_native_value = user_names[data.user_id]
+                else:
+                    self._attr_native_value = str(data.user_id)
+        elif key == "measurement_time":
+            # measurement_time is already a string, not a datetime
+            if data.measurement_time is not None:
+                self._attr_native_value = data.measurement_time
         else:
             value = getattr(data, key, None)
             if value is not None:
                 self._attr_native_value = value
-
-        # Add measurement history as extra state attributes for the systolic sensor
-        if key == "systolic" and data.measurements:
-            self._attr_extra_state_attributes = {
-                "measurements": [
-                    {
-                        "systolic": m.systolic,
-                        "diastolic": m.diastolic,
-                        "pulse": m.pulse,
-                        "map": m.mean_arterial_pressure,
-                        "time": m.timestamp_str,
-                        "irregular": m.irregular_heartbeat,
-                    }
-                    for m in data.measurements[-10:]  # last 10
-                ]
-            }
 
         self.async_write_ha_state()

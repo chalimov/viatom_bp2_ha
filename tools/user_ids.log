@@ -1,0 +1,21 @@
+=== BP2 User ID Collector ===
+Date: 2026-03-08T12:07:39.768906
+CMD 0x00 response (40 bytes):
+    0000: 10 db 11 00 6a c2 11 00 d4 19 00 00 93 db 40 05  ....j.........@.
+    0010: 3a 68 cd 03 6d 67 03 01 ea 04 03 a0 3e 04 00 14  :h..mg......>...
+    0020: 00 00 00 00 00 00 00 03                          ........
+  Possible user_id at offset 0: 1170192 (0x0011DB10)
+  Possible user_id at offset 4: 1163882 (0x0011C26A)
+  Possible user_id at offset 7: 1692672 (0x0019D400)
+  Possible user_id at offset 27: 278176 (0x00043EA0)
+  Possible user_id at offset 29: 1310724 (0x00140004)
+
+CMD 0x08 response (32 bytes):
+    0000: 03 00 51 85 0f c2 11 00 d4 ff 00 00 93 db 40 05  ..Q...........@.
+    0010: 3a 68 cd 03 6d 67 03 01 ea 04 03 a0 3e 04 00 00  :h..mg......>...
+
+bp2nibp.list: 47 bytes
+Header (10 bytes): 01010000000000000000
+  Record 0: uid=278176 sys=134 dia=81 pulse=95 hr=65
+
+User 278176: count=1, LE=a03e0400, BE=00043ea0

@@ -19,19 +19,33 @@
       "no_devices_found": "No Viatom BP2 devices found. Make sure the device is powered on and within range of your BLE proxy."
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "User Name Mapping",
+        "description": "Enter friendly names for each discovered user ID. These are Viatom cloud account numbers that appear in BP records. Leave blank to show the numeric ID."
+      }
+    }
+  },
   "entity": {
     "sensor": {
+      "blood_pressure": {
+        "name": "Blood Pressure"
+      },
       "systolic": {
         "name": "Systolic"
       },
       "diastolic": {
         "name": "Diastolic"
       },
-      "pulse": {
-        "name": "Pulse"
-      },
       "mean_arterial_pressure": {
         "name": "Mean Arterial Pressure"
+      },
+      "heart_rate": {
+        "name": "Heart Rate"
+      },
+      "pulse_pressure": {
+        "name": "Pulse Pressure"
       },
       "measurement_time": {
         "name": "Last Measurement Time"
@@ -44,6 +58,9 @@
       },
       "irregular_heartbeat": {
         "name": "Irregular Heartbeat"
+      },
+      "user_id": {
+        "name": "User"
       }
     }
   }

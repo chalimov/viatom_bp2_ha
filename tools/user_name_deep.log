@@ -1,0 +1,38 @@
+=== BP2 Deep User Name Hunt ===
+Date: 2026-03-08T11:53:50.025306
+Target: 46:22:4E:7C:B4:D8
+Known user_id: 218071 (0x000353D7)
+
+Subscribe attempt 1 failed: Not connected
+============================================================
+TEST 1: BLE Service/Characteristic Enumeration
+============================================================
+
+Service: 00001800-0000-1000-8000-00805f9b34fb — Generic Access Profile
+  Char: 00002a00-0000-1000-8000-00805f9b34fb [read] — Device Name
+    Value (12 bytes): 4c502d425032572030383132
+    ASCII: ['LP-BP2W 0812']
+    0000: 4c 50 2d 42 50 32 57 20 30 38 31 32              LP-BP2W 0812
+  Char: 00002a01-0000-1000-8000-00805f9b34fb [read] — Appearance
+    Value (2 bytes): 0000
+    0000: 00 00                                            ..
+
+Service: 0000fe59-0000-1000-8000-00805f9b34fb — Nordic Semiconductor ASA
+  Char: 8ec90001-f315-4f60-9fb8-838830daea50 [notify, write] — DFU Control Point
+    Descriptor 00002902-0000-1000-8000-00805f9b34fb (2 bytes): 0100
+  Char: 8ec90002-f315-4f60-9fb8-838830daea50 [read, write-without-response] — DFU Packet
+    Value (0 bytes): 
+
+  Char: 00000003-0000-1000-8000-00805f9b34fb [read] — RFCOMM
+    Value (12 bytes): 76657273696f6e2d76300000
+    ASCII: ['version-v0']
+    0000: 76 65 72 73 69 6f 6e 2d 76 30 00 00              version-v0..
+
+Service: 14839ac4-7d7e-415c-9a42-167340cf2339 — Unknown
+  Char: 8b00ace7-eb0b-49b0-bbe9-9aee0a26e1a3 [read, write-without-response, write] — Unknown
+    Value (0 bytes): 
+
+  Char: 0734594a-a8e7-4b1a-a6b1-cd5243059a57 [read, notify, write] — Unknown
+    Value (0 bytes): 
+
+    Descriptor 00002902-0000-1000-8000-00805f9b34fb (2 bytes): 0100
