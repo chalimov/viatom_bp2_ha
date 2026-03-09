@@ -1146,10 +1146,12 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         if self._data.measurements:
             newest = max(self._data.measurements, key=lambda r: r.timestamp)
             self._data.update_from_bp_result(newest)
+            self._fetch_succeeded = True
         _LOGGER.info(
             "Restored %d measurements from storage",
             len(self._data.measurements),
         )
+        self.async_set_updated_data(self._data)
 
     # ------------------------------------------------------------------
     # Disconnect
