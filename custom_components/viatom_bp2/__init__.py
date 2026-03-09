@@ -55,6 +55,9 @@ async def async_setup_entry(
         hass, entry, address, name, user_names=user_names
     )
 
+    # Restore measurement history from persistent storage
+    await coordinator.async_load_data()
+
     # Store coordinator in runtime_data (modern HA pattern, auto-cleaned on unload)
     entry.runtime_data = coordinator
 

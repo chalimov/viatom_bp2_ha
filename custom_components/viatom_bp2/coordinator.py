@@ -50,6 +50,7 @@ DANGEROUS — NEVER send on LP-BP2W:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from datetime import datetime, timedelta, timezone
 import logging
 import struct
@@ -64,6 +65,7 @@ from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothServiceInfoBleak
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
@@ -139,6 +141,10 @@ FILE_DOWNLOAD_TIMEOUT = 30.0
 # Disconnect after this many seconds of continuous idle (state 3).
 # Frees the BLE proxy slot for other devices.
 IDLE_DISCONNECT_TIMEOUT = 120
+
+# Persistent storage for measurement history
+STORAGE_VERSION = 1
+STORAGE_KEY_PREFIX = "viatom_bp2"
 
 # State name map for logging
 _STATE_NAMES = {
@@ -304,6 +310,10 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         self._fetch_succeeded = False  # persists across connections
         self._last_fetch_new_count: int = 0  # result of last file download
         self._new_data_pending = False  # triggers fast 1s reconnect
+        # Persistent storage for measurement history
+        self._store = Store(
+            hass, STORAGE_VERSION, f"{STORAGE_KEY_PREFIX}_{address}"
+        )
 
     @property
     def bp_data(self) -> ViatomBP2Data:
@@ -649,7 +659,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                         len(self._data._known_keys),
                     )
                     self.async_set_updated_data(self._data)
-                    # Stay connected — continue monitoring on this connection.
+                    self.hass.async_create_task(self.async_save_data())
 
                 else:
                     # _fetch_succeeded=True — just monitor
@@ -1100,12 +1110,46 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     # ------------------------------------------------------------------
     async def async_shutdown(self) -> None:
         """Clean up on integration unload — cancel tasks, disconnect BLE."""
+        await self.async_save_data()
         if self._monitor_task and not self._monitor_task.done():
             self._monitor_task.cancel()
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
         if self._current_client:
             await self._disconnect(self._current_client)
+
+    # ------------------------------------------------------------------
+    # Persistent storage — measurement history
+    # ------------------------------------------------------------------
+    async def async_save_data(self) -> None:
+        """Persist measurements and known_keys to disk."""
+        data = {
+            "measurements": [
+                dataclasses.asdict(m) for m in self._data.measurements
+            ],
+            "known_keys": [list(k) for k in self._data._known_keys],
+        }
+        await self._store.async_save(data)
+        _LOGGER.debug(
+            "Saved %d measurements to storage", len(self._data.measurements)
+        )
+
+    async def async_load_data(self) -> None:
+        """Restore measurements and known_keys from disk."""
+        data = await self._store.async_load()
+        if not data:
+            return
+        for item in data.get("measurements", []):
+            self._data.measurements.append(BpResult(**item))
+        for key in data.get("known_keys", []):
+            self._data._known_keys.add(tuple(key))
+        if self._data.measurements:
+            newest = max(self._data.measurements, key=lambda r: r.timestamp)
+            self._data.update_from_bp_result(newest)
+        _LOGGER.info(
+            "Restored %d measurements from storage",
+            len(self._data.measurements),
+        )
 
     # ------------------------------------------------------------------
     # Disconnect
