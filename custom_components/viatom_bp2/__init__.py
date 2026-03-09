@@ -55,7 +55,8 @@ async def async_setup_entry(
         hass, entry, address, name, user_names=user_names
     )
 
-    # Restore measurement history from persistent storage
+    # Load measurement history into coordinator BEFORE entities are created,
+    # so sensors can read initial values from coordinator.data in their __init__.
     await coordinator.async_load_data()
 
     # Store coordinator in runtime_data (modern HA pattern, auto-cleaned on unload)
@@ -78,6 +79,10 @@ async def async_setup_entry(
     )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Push restored data to entities now that they exist and are listening
+    if coordinator.data and coordinator.data.measurements:
+        coordinator.async_set_updated_data(coordinator.data)
 
     _LOGGER.info(
         "Viatom BP2 integration set up for %s (%s) — "
