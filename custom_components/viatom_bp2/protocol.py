@@ -105,7 +105,7 @@ class BpResult:
     def timestamp_str(self) -> str:
         if self.timestamp > 0:
             return time.strftime(
-                "%Y-%m-%d %H:%M:%S", time.localtime(self.timestamp)
+                "%Y-%m-%d %H:%M:%S", time.gmtime(self.timestamp)
             )
         return ""
 
