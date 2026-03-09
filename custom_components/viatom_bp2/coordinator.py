@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 import logging
 import struct
 import time
@@ -190,10 +190,11 @@ class ViatomBP2Data:
         self.user_id = result.user_id
         self.irregular_heartbeat = result.irregular_heartbeat
         if result.timestamp > 0:
-            # Use HA timezone for consistent display
-            utc_dt = datetime.fromtimestamp(result.timestamp, tz=timezone.utc)
-            local_dt = dt_util.as_local(utc_dt)
-            self.measurement_time = local_dt.strftime("%Y-%m-%d %H:%M:%S")
+            # Device stores local time as a fake UTC unix timestamp —
+            # treat it as-is without timezone conversion.
+            self.measurement_time = time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.gmtime(result.timestamp)
+            )
         else:
             self.measurement_time = None
         self.last_update = time.monotonic()
