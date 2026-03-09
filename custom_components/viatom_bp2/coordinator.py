@@ -29,7 +29,7 @@ ALGORITHM — SINGLE FLAG (_fetch_succeeded):
 
   First connection starts with _fetch_succeeded=False, so the first
   IDLE triggers a fetch (the "baseline").  After every fetch attempt
-  we disconnect and reconnect (fast 3s via _new_data_pending).
+  we disconnect and reconnect (fast 1s via _new_data_pending).
   This guarantees each connection's one transfer slot is fresh.
 
 SAFE commands (no screen change, invisible to user):
@@ -111,8 +111,9 @@ _LOGGER = logging.getLogger(__name__)
 # Maximum number of stored measurements to keep in memory
 MAX_STORED_MEASUREMENTS = 50
 
-# Maximum BLE connection retries
-MAX_CONNECT_RETRIES = 3
+# Maximum BLE connection retries (2 is enough — first attempt may fail
+# while ESPHome proxy warms up after HA restart, second succeeds)
+MAX_CONNECT_RETRIES = 2
 
 # Post-connect stabilization delay (seconds).
 # GATT services need time to be discovered after the low-level connection.
@@ -298,7 +299,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         # Poll loop state machine — single flag algorithm
         self._fetch_succeeded = False  # persists across connections
         self._last_fetch_new_count: int = 0  # result of last file download
-        self._new_data_pending = False  # triggers fast 3s reconnect
+        self._new_data_pending = False  # triggers fast 1s reconnect
 
     @property
     def bp_data(self) -> ViatomBP2Data:
@@ -974,12 +975,12 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         HA may not report repeated identical advertisements as "changes".
 
         When _new_data_pending is True (measurement detected in poll loop),
-        uses a fast 3s interval to minimize the delay before fetching new
+        uses a fast 1s interval to minimize the delay before fetching new
         data on the reconnected session.  Otherwise checks every 15s.
         """
         fast = self._new_data_pending
-        interval = 3 if fast else 15
-        max_attempts = 20 if fast else 8  # 20×3s=60s or 8×15s=120s
+        interval = 1 if fast else 15
+        max_attempts = 60 if fast else 8  # 60×1s=60s or 8×15s=120s
 
         _LOGGER.info(
             "Starting reconnect loop for %s (fast=%s, interval=%ds)",
