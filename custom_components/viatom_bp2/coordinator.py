@@ -13,24 +13,26 @@ FIRMWARE LIMITATION — ONE TRANSFER PER CONNECTION:
   The LP-BP2W firmware allows only ONE FILE_START per BLE connection.
   A second FILE_START on the same connection returns byte[3]=0xe1.
 
-ALGORITHM — SINGLE FLAG (_fetch_succeeded):
+ALGORITHM — RECONNECT-DURING-MEASUREMENT:
   Connect → housekeeping → poll loop.  One persistent flag controls
   whether to fetch or just monitor:
 
     _fetch_succeeded=False (need data):
-      RESULT or IDLE → fetch → disconnect → reconnect
-        success → _fetch_succeeded=True
-        rejected → _fetch_succeeded stays False
+      RESULT or IDLE → fetch
+        success → _fetch_succeeded=True, stay connected, keep monitoring
+        rejected → disconnect → fast reconnect → retry
+      BUSY → just monitor (wait for result)
 
     _fetch_succeeded=True (have data, monitoring):
-      BUSY → _fetch_succeeded=False (new measurement started)
+      BUSY detected → need fresh FILE_START slot for upcoming fetch:
+        Single (MEASURING) → disconnect → reconnect immediately
+        Triple (TRIPLE-MEAS) → count transitions, reconnect on 3rd
       RESULT/IDLE → do nothing, just poll
       IDLE 120s → disconnect (idle timeout)
 
-  First connection starts with _fetch_succeeded=False, so the first
-  IDLE triggers a fetch (the "baseline").  After every fetch attempt
-  we disconnect and reconnect (fast 1s via _new_data_pending).
-  This guarantees each connection's one transfer slot is fresh.
+  After reconnect during measurement, _fetch_succeeded is reset to False
+  (non-fetch exit), so the poll loop will fetch when RESULT arrives.
+  The reconnect happens close to the fetch, keeping the slot fresh.
 
 SAFE commands (no screen change, invisible to user):
   CMD 0x00 (GET_INFO), 0x06 (GET_CONFIG), 0x30 (GET_BATTERY),
@@ -87,6 +89,8 @@ from .protocol import (
     CMD_GET_LP_CONFIG,
     FILE_BP_LIST,
     DEVICE_STATE_IDLE,
+    DEVICE_STATE_MEASURING,
+    DEVICE_STATE_TRIPLE_MEAS,
     DEVICE_STATES_RESULT,
     DEVICE_STATES_BUSY,
     BpResult,
@@ -522,16 +526,25 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
 
         Single flag: _fetch_succeeded (persists across connections).
 
-          BUSY  → set _fetch_succeeded=False (new measurement started)
-          RESULT/IDLE when _fetch_succeeded=False → fetch → disconnect
-          RESULT/IDLE when _fetch_succeeded=True  → just monitor
+          BUSY when _fetch_succeeded=True → reconnect to refresh FILE_START slot
+            - Single (MEASURING): reconnect immediately
+            - Triple (TRIPLE-MEAS): reconnect on 3rd measurement start
+          BUSY when _fetch_succeeded=False → just monitor
+          RESULT/IDLE when _fetch_succeeded=False → fetch
+            - Rejected → disconnect for immediate reconnect
+            - Success → continue monitoring on same connection
+          RESULT/IDLE when _fetch_succeeded=True → just monitor
           IDLE 120s → disconnect (idle timeout)
-
-        After every fetch attempt we disconnect and reconnect.
         """
         idle_since: float | None = None
         consecutive_errors = 0
         exited_after_fetch = False
+        # Track whether this connection's FILE_START slot is stale (already
+        # used) and we need to reconnect before the next fetch.
+        needs_slot_refresh = False
+        # Count transitions INTO TRIPLE-MEAS (not raw polls) to detect 3rd.
+        triple_meas_count = 0
+        prev_state: int | None = None
 
         while client.is_connected:
             state = await self._poll_device_state(client)
@@ -554,12 +567,60 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
 
             if state in DEVICE_STATES_BUSY:
                 idle_since = None
-                self._fetch_succeeded = False
-                _LOGGER.debug(
-                    "State %d (%s) — measurement in progress",
-                    state,
-                    state_name,
-                )
+
+                # First BUSY after a successful fetch — we need a fresh slot.
+                if self._fetch_succeeded:
+                    needs_slot_refresh = True
+                    triple_meas_count = 0
+                    self._fetch_succeeded = False
+
+                if needs_slot_refresh:
+                    if state == DEVICE_STATE_MEASURING:
+                        # Single measurement — reconnect now for fresh slot.
+                        _LOGGER.info(
+                            "State %d (%s) — single measurement, "
+                            "reconnecting for fresh FILE_START slot",
+                            state,
+                            state_name,
+                        )
+                        self._new_data_pending = True
+                        break
+
+                    if (
+                        state == DEVICE_STATE_TRIPLE_MEAS
+                        and prev_state != DEVICE_STATE_TRIPLE_MEAS
+                    ):
+                        # Transition INTO TRIPLE-MEAS (from PAUSE or start).
+                        triple_meas_count += 1
+                        if triple_meas_count >= 3:
+                            _LOGGER.info(
+                                "State %d (%s) — 3rd triple measurement, "
+                                "reconnecting for fresh FILE_START slot",
+                                state,
+                                state_name,
+                            )
+                            self._new_data_pending = True
+                            break
+                        _LOGGER.debug(
+                            "State %d (%s) — triple measurement %d/3, "
+                            "waiting",
+                            state,
+                            state_name,
+                            triple_meas_count,
+                        )
+                    else:
+                        _LOGGER.debug(
+                            "State %d (%s) — measurement in progress",
+                            state,
+                            state_name,
+                        )
+                else:
+                    self._fetch_succeeded = False
+                    _LOGGER.debug(
+                        "State %d (%s) — measurement in progress",
+                        state,
+                        state_name,
+                    )
 
             elif state in DEVICE_STATES_RESULT or state == DEVICE_STATE_IDLE:
                 if not self._fetch_succeeded:
@@ -574,27 +635,30 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                             "Fetch rejected — disconnecting for "
                             "immediate reconnect"
                         )
-                    else:
-                        self._fetch_succeeded = True
-                        _LOGGER.info(
-                            "Fetch complete: %d new records (%d total known)",
-                            new_count,
-                            len(self._data._known_keys),
-                        )
-                    # Always fast reconnect — firmware allows only one
-                    # FILE_START per connection, so we must reconnect to
-                    # be ready for the next measurement.
-                    self._new_data_pending = True
-                    self.async_set_updated_data(self._data)
-                    exited_after_fetch = True
-                    break
+                        self._new_data_pending = True
+                        self.async_set_updated_data(self._data)
+                        exited_after_fetch = True
+                        break
 
-                # _fetch_succeeded=True — just monitor
-                _LOGGER.debug(
-                    "State %d (%s) — already fetched, monitoring",
-                    state,
-                    state_name,
-                )
+                    self._fetch_succeeded = True
+                    needs_slot_refresh = False
+                    triple_meas_count = 0
+                    _LOGGER.info(
+                        "Fetch complete: %d new records (%d total known)",
+                        new_count,
+                        len(self._data._known_keys),
+                    )
+                    self.async_set_updated_data(self._data)
+                    # Stay connected — continue monitoring on this connection.
+
+                else:
+                    # _fetch_succeeded=True — just monitor
+                    _LOGGER.debug(
+                        "State %d (%s) — already fetched, monitoring",
+                        state,
+                        state_name,
+                    )
+
                 if state == DEVICE_STATE_IDLE:
                     if idle_since is None:
                         idle_since = time.monotonic()
@@ -612,6 +676,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 )
                 break
 
+            prev_state = state
             await asyncio.sleep(STATE_POLL_INTERVAL)
 
         # Reset _fetch_succeeded if we exited due to idle timeout, connection
