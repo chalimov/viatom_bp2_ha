@@ -519,7 +519,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             self._start_reconnect()
 
     # ------------------------------------------------------------------
-    # Poll loop — CMD 0x06 every 5s, single-flag algorithm
+    # Poll loop — CMD 0x06 every 5s, reconnect-during-measurement
     # ------------------------------------------------------------------
     async def _poll_loop(self, client: BleakClient) -> None:
         """Poll device state via CMD 0x06, handle measurement lifecycle.
