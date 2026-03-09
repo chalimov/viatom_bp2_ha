@@ -51,7 +51,7 @@
         "name": "Pulse Pressure"
       },
       "measurement_time": {
-        "name": "Last Measurement Time"
+        "name": "Time"
       },
       "battery_level": {
         "name": "Battery"
