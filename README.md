@@ -142,12 +142,12 @@ automation:
 
 ## Supported Devices
 
-| Device     | Status         | Notes                          |
-|------------|----------------|--------------------------------|
-| LP-BP2W    | Tested         | Primary development device     |
-| BP2        | Untested       | Same Lepu protocol expected    |
-| BP2A       | Untested       | Same Lepu protocol expected    |
-| BP2 Connect| Unknown        | May use different firmware      |
+| Device      | BLE Name   | Status         | Notes                          |
+|-------------|------------|----------------|--------------------------------|
+| BP2 Connect | LP-BP2W    | Tested         | Primary development device     |
+| BP2         | BP2        | Untested       | Same Lepu protocol expected    |
+| BP2A        | BP2A       | Untested       | Same Lepu protocol expected    |
+| Checkme BP2 | Checkme BP2| Untested       | Same Lepu protocol expected    |
 
 ## Credits
 
