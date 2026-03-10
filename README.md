@@ -142,11 +142,13 @@ automation:
 
 ## Supported Devices
 
-| Device      | BLE Name    | Status         | Notes                          |
-|-------------|-------------|----------------|--------------------------------|
-| BP2 Connect | LP-BP2W     | Tested         | Primary development device     |
-| BP2 / Checkme BP2 | BP2, Checkme BP2 | Untested | Same Lepu protocol expected |
-| BP2A        | BP2A        | Untested       | Same Lepu protocol expected    |
+All devices are sold under the **Checkme** brand by Viatom.
+
+| Device      | BLE Name     | Status   | Notes                            |
+|-------------|--------------|----------|----------------------------------|
+| BP2 Connect | LP-BP2W      | Tested   | 2-in-1 BP + EKG, development device |
+| BP2         | BP2          | Untested | Upper arm BP monitor             |
+| BP2A        | BP2A         | Untested | Compact/portable version         |
 
 ## Credits
 
