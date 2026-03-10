@@ -6,9 +6,10 @@ dist/
 build/
 *.egg
 
-# IDE
+# IDE / AI tools
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 
