@@ -311,6 +311,8 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         self._fetch_succeeded = False  # persists across connections
         self._last_fetch_new_count: int = 0  # result of last file download
         self._new_data_pending = False  # triggers fast 1s reconnect
+        # Manual connection control (switch entity)
+        self._connection_enabled = True
         # Persistent storage for measurement history
         self._store = Store(
             hass, STORAGE_VERSION, f"{STORAGE_KEY_PREFIX}_{address}"
@@ -337,6 +339,8 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         stay connected, polling device state until idle timeout.
         """
         self._data.rssi = service_info.rssi
+        if not self._connection_enabled:
+            return
         now = time.monotonic()
         _LOGGER.debug(
             "BLE advertisement from %s (RSSI: %s, change: %s, "
@@ -383,6 +387,8 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
 
     def _start_monitor(self) -> None:
         """Start a new _connect_and_monitor task, cancelling any existing."""
+        if not self._connection_enabled:
+            return
         self._cancel_reconnect()
         if self._monitor_task and not self._monitor_task.done():
             self._monitor_task.cancel()
@@ -1120,6 +1126,30 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             await self._disconnect(self._current_client)
 
     # ------------------------------------------------------------------
+    # Manual connection control (switch entity)
+    # ------------------------------------------------------------------
+    async def async_disable_connection(self) -> None:
+        """Disable BLE connection — disconnect and suppress reconnection."""
+        self._connection_enabled = False
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
+        if self._current_client:
+            await self._disconnect(self._current_client)
+        self._data.device_state_text = "Disabled"
+        self.async_set_updated_data(self._data)
+        _LOGGER.info("BLE connection disabled for %s", self.address)
+
+    async def async_enable_connection(self) -> None:
+        """Re-enable BLE connection — normal operation resumes."""
+        self._connection_enabled = True
+        self._data.device_state_text = "Disconnected"
+        self.async_set_updated_data(self._data)
+        _LOGGER.info("BLE connection enabled for %s", self.address)
+
+    # ------------------------------------------------------------------
     # Persistent storage — measurement history
     # ------------------------------------------------------------------
     async def async_save_data(self) -> None:
@@ -1190,7 +1220,12 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         wasn't triggered (e.g., stable advertisements that HA doesn't
         report as changes).
         """
-        if not self._connected and not self._connecting and not self._has_active_task():
+        if (
+            self._connection_enabled
+            and not self._connected
+            and not self._connecting
+            and not self._has_active_task()
+        ):
             ble_device = bluetooth.async_ble_device_from_address(
                 self.hass, self.address, connectable=True
             )

@@ -68,6 +68,11 @@
       "user_id": {
         "name": "User"
       }
+    },
+    "switch": {
+      "ble_connection": {
+        "name": "BLE Connection"
+      }
     }
   }
 }
