@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from homeassistant.components.switch import SwitchDeviceClass, SwitchEntity
@@ -15,6 +16,8 @@ from . import ViatomBP2ConfigEntry
 from .const import DOMAIN, MANUFACTURER
 from .coordinator import ViatomBP2Coordinator
 
+_LOGGER = logging.getLogger(__name__)
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -22,8 +25,12 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the BLE connection switch."""
+    _LOGGER.warning("Switch async_setup_entry called for %s", entry.entry_id)
     coordinator = entry.runtime_data
-    async_add_entities([ViatomBP2ConnectionSwitch(coordinator, entry)])
+    entity = ViatomBP2ConnectionSwitch(coordinator, entry)
+    _LOGGER.warning("Switch entity created: unique_id=%s", entity.unique_id)
+    async_add_entities([entity])
+    _LOGGER.warning("Switch entity added")
 
 
 class ViatomBP2ConnectionSwitch(
