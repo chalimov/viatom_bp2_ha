@@ -325,12 +325,11 @@ def parse_device_info_v1(payload: bytes) -> DeviceInfo:
     info = DeviceInfo()
     try:
         if len(payload) >= 40:
-            # Battery level appears to be around byte 24-25 based on
-            # the values changing between probe runs (c8=200 -> %, or
-            # the byte at offset 24 = 0x01 = charging status)
-            # For now extract what we can confirm
-            info.battery_level = payload[24]  # observed as 0x01 or status byte
-            info.battery_status = payload[25]
+            # Best-guess from undocumented GET_INFO response:
+            # byte[24] observed as 0x00/0x01 (charging status flag)
+            # byte[25] may be battery level (percentage) — unverified
+            info.battery_status = payload[24]
+            info.battery_level = payload[25]
         _LOGGER.debug(
             "CMD 0x00 raw (40b): %s", payload.hex()
         )
@@ -564,6 +563,8 @@ def parse_bp_file(payload: bytes) -> list[BpResult]:
 # ---------------------------------------------------------------------------
 # Command builders (Protocol V2)
 # ---------------------------------------------------------------------------
+# Module-level sequence counter — shared across all coordinator instances.
+# This is harmless because responses are matched by cmd_byte, not seq number.
 _seq_counter = count(1)
 
 

@@ -211,7 +211,7 @@ class ViatomBP2Data:
             self.heart_rate = rt.heart_rate
             self.pulse_pressure = rt.systolic - rt.diastolic
             now = dt_util.now()
-            self.measurement_time = now.isoformat()
+            self.measurement_time = now.strftime("%Y-%m-%d %H:%M:%S")
             self.last_update = time.monotonic()
             result = BpResult(
                 systolic=rt.systolic,
@@ -245,16 +245,21 @@ class ViatomBP2Data:
             self.measurements = self.measurements[-MAX_STORED_MEASUREMENTS:]
         max_known = MAX_STORED_MEASUREMENTS * 4
         if len(self._known_keys) > max_known:
-            # Keep only keys for measurements still in the list
+            # Keep keys for retained measurements AND current batch to prevent
+            # re-ingesting records that were trimmed but still exist on device
             retained = {
                 (m.timestamp, m.systolic, m.diastolic, m.mean_arterial_pressure)
                 for m in self.measurements
             }
-            self._known_keys = retained
+            batch_keys = {
+                (r.timestamp, r.systolic, r.diastolic, r.mean_arterial_pressure)
+                for r in records
+            }
+            self._known_keys = retained | batch_keys
 
-        # Update "current" to newest record by timestamp
-        if records:
-            newest = max(records, key=lambda r: r.timestamp)
+        # Update "current" to newest record only when new records were added
+        if new_count > 0 and self.measurements:
+            newest = max(self.measurements, key=lambda r: r.timestamp)
             self.update_from_bp_result(newest)
 
         return new_count
@@ -294,7 +299,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         # File transfer state
         self._file_data_buffer = bytearray()
         self._file_size: int = 0
-        self._file_offset: int = 0
+        self._file_transfer_task: asyncio.Task | None = None
         self._all_files_done = asyncio.Event()
         self._all_files_done.set()
         # BLE connection state
@@ -303,6 +308,8 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         # Task tracking — prevent concurrent connections
         self._monitor_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
+        self._monitor_generation: int = 0  # generation counter for task identity
+        self._shutting_down: bool = False  # prevents reconnect during shutdown
         # Per-command response events: cmd_byte → asyncio.Event
         self._pending_responses: dict[int, asyncio.Event] = {}
         # Device state polling (CMD 0x06 byte[0])
@@ -317,11 +324,17 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         self._store = Store(
             hass, STORAGE_VERSION, f"{STORAGE_KEY_PREFIX}_{address}"
         )
+        self._save_lock = asyncio.Lock()
 
     @property
     def bp_data(self) -> ViatomBP2Data:
         """Return current data."""
         return self._data
+
+    @property
+    def connection_enabled(self) -> bool:
+        """Whether BLE connection is enabled (for switch entity)."""
+        return self._connection_enabled
 
     # ------------------------------------------------------------------
     # BLE advertisement handler — triggers connection
@@ -393,14 +406,18 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         if self._monitor_task and not self._monitor_task.done():
             self._monitor_task.cancel()
         self._connecting = True
+        self._monitor_generation += 1
+        gen = self._monitor_generation
         self._monitor_task = self._entry.async_create_background_task(
             self.hass,
-            self._connect_and_monitor(),
+            self._connect_and_monitor(gen),
             name=f"viatom_bp2_connect_{self.address}",
         )
 
     def _start_reconnect(self) -> None:
         """Start a reconnect loop task (only if no active tasks)."""
+        if not self._connection_enabled or self._shutting_down:
+            return
         if self._has_active_task():
             _LOGGER.debug("Skipping reconnect — task already active")
             return
@@ -413,14 +430,18 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     # ------------------------------------------------------------------
     # Connect, housekeep, then enter poll loop
     # ------------------------------------------------------------------
-    async def _connect_and_monitor(self) -> None:
-        """Connect to BP2, run housekeeping, then poll loop."""
+    async def _connect_and_monitor(self, gen: int) -> None:
+        """Connect to BP2, run housekeeping, then poll loop.
+
+        Args:
+            gen: Generation counter — only the latest generation performs
+                 cleanup (clear task reference, start reconnect) in finally.
+        """
         # Reset per-connection state (but NOT _fetch_succeeded — it persists)
         self._new_data_pending = False
         self._reassembler.reset()
         self._file_data_buffer.clear()
         self._file_size = 0
-        self._file_offset = 0
         self._device_state = None
 
         ble_device = bluetooth.async_ble_device_from_address(
@@ -432,6 +453,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             return
 
         client: BleakClient | None = None
+        should_reconnect = True
         try:
             _LOGGER.info("Connecting to BP2 at %s ...", self.address)
             self._data.device_state_text = "Connecting"
@@ -510,7 +532,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             # No separate fetch phase — the poll loop handles everything
             # via the single _fetch_succeeded flag.
             _LOGGER.info("=== Entering state poll loop ===")
-            await self._poll_loop(client)
+            should_reconnect = await self._poll_loop(client)
 
         except BleakError as e:
             _LOGGER.warning("BLE error with BP2 at %s: %s", self.address, e)
@@ -523,23 +545,32 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 await self._disconnect(client)
             self._current_client = None
             self._connecting = False
+            if self._file_transfer_task and not self._file_transfer_task.done():
+                self._file_transfer_task.cancel()
+                self._file_transfer_task = None
             self.async_set_updated_data(self._data)
 
-            # Clear _monitor_task BEFORE starting reconnect, so
-            # _has_active_task() doesn't see the current (finishing) task.
-            self._monitor_task = None
-
-            # Schedule reconnection attempts — the bluetooth callback may not
-            # fire again if the ESPHome proxy cached the device address. We
-            # actively retry for up to 60s after disconnect to catch a device
-            # that is still on (or turned back on quickly).
-            self._start_reconnect()
+            # Only perform cleanup if we are still the active generation.
+            # If _start_monitor() was called while we were running, our
+            # generation is stale — the new task owns cleanup.
+            if self._monitor_generation == gen:
+                self._monitor_task = None
+                if (
+                    self._connection_enabled
+                    and not self._shutting_down
+                    and should_reconnect
+                ):
+                    self._start_reconnect()
 
     # ------------------------------------------------------------------
     # Poll loop — CMD 0x06 every 5s, reconnect-during-measurement
     # ------------------------------------------------------------------
-    async def _poll_loop(self, client: BleakClient) -> None:
+    async def _poll_loop(self, client: BleakClient) -> bool:
         """Poll device state via CMD 0x06, handle measurement lifecycle.
+
+        Returns True if reconnect should be attempted after exit (measurement
+        break, connection loss, errors), False if disconnect was intentional
+        (idle timeout).
 
         Single flag: _fetch_succeeded (persists across connections).
 
@@ -632,6 +663,8 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                             state_name,
                         )
                 else:
+                    # Protective: ensure fetch happens after this measurement
+                    # (already False in most paths, but guards edge cases)
                     self._fetch_succeeded = False
                     _LOGGER.debug(
                         "State %d (%s) — measurement in progress",
@@ -691,16 +724,18 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                     "Idle for %ds — disconnecting to free BLE proxy slot",
                     IDLE_DISCONNECT_TIMEOUT,
                 )
-                break
+                self._fetch_succeeded = False
+                return False  # intentional disconnect — don't reconnect
 
             prev_state = state
             await asyncio.sleep(STATE_POLL_INTERVAL)
 
-        # Reset _fetch_succeeded if we exited due to idle timeout, connection
-        # loss, or errors (NOT after a fetch).  This ensures the next connection
-        # will fetch — the device may have new data we missed while disconnected.
+        # Reset _fetch_succeeded if we exited due to connection loss or errors
+        # (NOT after a fetch).  This ensures the next connection will fetch —
+        # the device may have new data we missed while disconnected.
         if not exited_after_fetch:
             self._fetch_succeeded = False
+        return True  # reconnect (measurement break, connection loss, errors)
 
     async def _poll_device_state(self, client: BleakClient) -> int | None:
         """Send CMD 0x06 (GET_CONFIG) and extract device state from byte[0].
@@ -738,7 +773,6 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         """
         self._file_data_buffer.clear()
         self._file_size = 0
-        self._file_offset = 0
         self._all_files_done.clear()
         self._last_fetch_new_count = 0
 
@@ -786,11 +820,15 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             )
             return False
         finally:
-            self._pending_responses.pop(cmd_byte, None)
+            # Only remove if we are still the registered event (not overwritten
+            # by a concurrent _send_and_wait for the same cmd_byte)
+            if self._pending_responses.get(cmd_byte) is event:
+                self._pending_responses.pop(cmd_byte, None)
 
     async def _write_command(self, client: BleakClient, data: bytes) -> None:
         """Write a command to the Lepu write characteristic."""
         if not client.is_connected:
+            _LOGGER.debug("Write skipped — client not connected")
             return
         try:
             await client.write_gatt_char(WRITE_UUID, data, response=True)
@@ -800,21 +838,19 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 data.hex(),
             )
         except BleakError as first_err:
-            _LOGGER.debug(
-                "Write-with-response failed (%s), trying without response",
+            _LOGGER.warning(
+                "Write-with-response failed (%s), retrying without response",
                 first_err,
             )
-            try:
-                await client.write_gatt_char(
-                    WRITE_UUID, data, response=False
-                )
-                _LOGGER.debug(
-                    "Sent command (no-resp) on %s: %s",
-                    WRITE_UUID[:12],
-                    data.hex(),
-                )
-            except BleakError as e:
-                _LOGGER.warning("Failed to write command: %s", e)
+            # Let this propagate on failure — callers handle BleakError
+            await client.write_gatt_char(
+                WRITE_UUID, data, response=False
+            )
+            _LOGGER.debug(
+                "Sent command (no-resp) on %s: %s",
+                WRITE_UUID[:12],
+                data.hex(),
+            )
 
     def _notification_handler(
         self, _sender: Any, data: bytearray
@@ -935,9 +971,8 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 _LOGGER.info("File size: %d bytes", self._file_size)
                 if self._file_size > 0:
                     self._file_data_buffer.clear()
-                    self._file_offset = 0
                     # Request first chunk
-                    self._entry.async_create_background_task(
+                    self._file_transfer_task = self._entry.async_create_background_task(
                         self.hass,
                         self._request_file_chunk(0),
                         name=f"viatom_bp2_file_{self.address}",
@@ -958,21 +993,21 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         # File data response (CMD 0xF3) — contains chunked file data
         elif packet.cmd == CMD_READ_FILE_DATA:
             self._file_data_buffer.extend(packet.payload)
-            self._file_offset += len(packet.payload)
+            received = len(self._file_data_buffer)
             _LOGGER.debug(
                 "File data chunk: %d bytes (total %d/%d)",
                 len(packet.payload),
-                len(self._file_data_buffer),
+                received,
                 self._file_size,
             )
-            if self._file_offset < self._file_size:
-                self._entry.async_create_background_task(
+            if received < self._file_size:
+                self._file_transfer_task = self._entry.async_create_background_task(
                     self.hass,
-                    self._request_file_chunk(self._file_offset),
+                    self._request_file_chunk(received),
                     name=f"viatom_bp2_file_{self.address}",
                 )
             else:
-                self._entry.async_create_background_task(
+                self._file_transfer_task = self._entry.async_create_background_task(
                     self.hass,
                     self._finish_file_read(),
                     name=f"viatom_bp2_file_end_{self.address}",
@@ -1074,6 +1109,11 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         for attempt in range(max_attempts):
             await asyncio.sleep(interval)
 
+            # Bail if connection was disabled or integration is shutting down
+            if not self._connection_enabled or self._shutting_down:
+                _LOGGER.debug("Reconnect loop: connection disabled/shutting down, stopping")
+                return
+
             # Bail if someone else already connected
             if self._connected or self._connecting:
                 _LOGGER.debug(
@@ -1116,28 +1156,46 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     # Shutdown (integration unload)
     # ------------------------------------------------------------------
     async def async_shutdown(self) -> None:
-        """Clean up on integration unload — cancel tasks, disconnect BLE."""
+        """Clean up on integration unload — cancel tasks, disconnect BLE.
+
+        Sets _shutting_down to prevent cancelled tasks' finally blocks from
+        starting new reconnect loops. Awaits task completion so finally blocks
+        run before the integration finishes unloading.
+        """
+        self._shutting_down = True
+        self._connection_enabled = False
         await self.async_save_data()
+
+        tasks_to_await: list[asyncio.Task] = []
         if self._monitor_task and not self._monitor_task.done():
             self._monitor_task.cancel()
+            tasks_to_await.append(self._monitor_task)
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
-        if self._current_client:
+            tasks_to_await.append(self._reconnect_task)
+
+        if tasks_to_await:
+            await asyncio.gather(*tasks_to_await, return_exceptions=True)
+
+        # Belt-and-suspenders: disconnect if no task was running to do it
+        if self._current_client and self._connected:
             await self._disconnect(self._current_client)
 
     # ------------------------------------------------------------------
     # Manual connection control (switch entity)
     # ------------------------------------------------------------------
     async def async_disable_connection(self) -> None:
-        """Disable BLE connection — disconnect and suppress reconnection."""
+        """Disable BLE connection — disconnect and suppress reconnection.
+
+        The cancelled monitor task's finally block handles disconnect.
+        We don't disconnect directly here to avoid double-disconnect races.
+        """
         self._connection_enabled = False
         if self._monitor_task and not self._monitor_task.done():
             self._monitor_task.cancel()
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
             self._reconnect_task = None
-        if self._current_client:
-            await self._disconnect(self._current_client)
         self._data.device_state_text = "Disabled"
         self.async_set_updated_data(self._data)
         _LOGGER.info("BLE connection disabled for %s", self.address)
@@ -1154,16 +1212,17 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     # ------------------------------------------------------------------
     async def async_save_data(self) -> None:
         """Persist measurements and known_keys to disk."""
-        data = {
-            "measurements": [
-                dataclasses.asdict(m) for m in self._data.measurements
-            ],
-            "known_keys": [list(k) for k in self._data._known_keys],
-        }
-        await self._store.async_save(data)
-        _LOGGER.debug(
-            "Saved %d measurements to storage", len(self._data.measurements)
-        )
+        async with self._save_lock:
+            data = {
+                "measurements": [
+                    dataclasses.asdict(m) for m in self._data.measurements
+                ],
+                "known_keys": [list(k) for k in self._data._known_keys],
+            }
+            await self._store.async_save(data)
+            _LOGGER.debug(
+                "Saved %d measurements to storage", len(self._data.measurements)
+            )
 
     async def async_load_data(self) -> None:
         """Restore measurements and known_keys from disk."""
@@ -1171,9 +1230,15 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         if not data:
             return
         for item in data.get("measurements", []):
-            self._data.measurements.append(BpResult(**item))
+            try:
+                self._data.measurements.append(BpResult(**item))
+            except (TypeError, KeyError) as exc:
+                _LOGGER.warning("Skipping corrupt measurement record: %s", exc)
         for key in data.get("known_keys", []):
-            self._data._known_keys.add(tuple(key))
+            try:
+                self._data._known_keys.add(tuple(key))
+            except (TypeError, ValueError) as exc:
+                _LOGGER.warning("Skipping corrupt known_key: %s", exc)
         if self._data.measurements:
             newest = max(self._data.measurements, key=lambda r: r.timestamp)
             self._data.update_from_bp_result(newest)
@@ -1219,6 +1284,10 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         This catches cases where the bluetooth advertisement callback
         wasn't triggered (e.g., stable advertisements that HA doesn't
         report as changes).
+
+        Safe to call _start_monitor() here — it checks _has_active_task(),
+        _connected, and _connecting, and the check-then-create is atomic
+        (no await between) on the event loop.
         """
         if (
             self._connection_enabled

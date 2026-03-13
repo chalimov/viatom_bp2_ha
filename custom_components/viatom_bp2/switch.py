@@ -54,7 +54,7 @@ class ViatomBP2ConnectionSwitch(
     @property
     def is_on(self) -> bool:
         """Return True if BLE connection is enabled."""
-        return self.coordinator._connection_enabled
+        return self.coordinator.connection_enabled
 
     @property
     def icon(self) -> str:

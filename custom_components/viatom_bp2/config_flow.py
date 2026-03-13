@@ -129,7 +129,7 @@ class ViatomBP2ConfigFlow(ConfigFlow, domain=DOMAIN):
     def _is_bp2(info: BluetoothServiceInfoBleak) -> bool:
         """Check if a BLE device is a Viatom BP2."""
         # Match by service UUID
-        if SERVICE_UUID in [u.lower() for u in info.service_uuids]:
+        if any(u.lower() == SERVICE_UUID for u in info.service_uuids):
             return True
         # Match by device name
         if info.name:
