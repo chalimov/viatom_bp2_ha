@@ -78,7 +78,13 @@ async def async_setup_entry(
         )
     )
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    _LOGGER.warning("Forwarding platform setups: %s", PLATFORMS)
+    try:
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        _LOGGER.warning("Platform setups complete")
+    except Exception:
+        _LOGGER.exception("Platform setup failed")
+        raise
 
     # Push restored data to entities now that they exist and are listening
     if coordinator.data and coordinator.data.measurements:
