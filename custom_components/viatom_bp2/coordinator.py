@@ -76,6 +76,7 @@ RECONNECT_INTERVAL = timedelta(seconds=30)
 
 from .const import (
     DOMAIN,
+    EVENT_NEW_MEASUREMENT,
     WRITE_UUID,
     NOTIFY_UUID,
 )
@@ -227,18 +228,18 @@ class ViatomBP2Data:
             return True
         return False
 
-    def ingest_file_records(self, records: list[BpResult]) -> int:
+    def ingest_file_records(self, records: list[BpResult]) -> list[BpResult]:
         """Ingest parsed BP records, deduplicating against known records.
 
-        Returns the number of new records added.
+        Returns each newly added record so callers can process the full batch.
         """
-        new_count = 0
+        new_records: list[BpResult] = []
         for r in records:
             key = (r.timestamp, r.systolic, r.diastolic, r.mean_arterial_pressure)
             if key not in self._known_keys:
                 self._known_keys.add(key)
                 self.measurements.append(r)
-                new_count += 1
+                new_records.append(r)
 
         # Trim measurements and known_keys to prevent unbounded growth
         if len(self.measurements) > MAX_STORED_MEASUREMENTS:
@@ -258,11 +259,11 @@ class ViatomBP2Data:
             self._known_keys = retained | batch_keys
 
         # Update "current" to newest record only when new records were added
-        if new_count > 0 and self.measurements:
+        if new_records and self.measurements:
             newest = max(self.measurements, key=lambda r: r.timestamp)
             self.update_from_bp_result(newest)
 
-        return new_count
+        return new_records
 
 
 class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
@@ -1028,7 +1029,8 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 results = parse_bp_file(bytes(self._file_data_buffer))
                 _LOGGER.info("Parsed %d BP records from file", len(results))
                 if results:
-                    new_count = self._data.ingest_file_records(results)
+                    new_records = self._data.ingest_file_records(results)
+                    new_count = len(new_records)
                     self._last_fetch_new_count = new_count
                     _LOGGER.info(
                         "Ingested %d new records (%d total known)",
@@ -1049,6 +1051,22 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                         newest.user_id,
                         newest.timestamp_str,
                     )
+                    for result in sorted(new_records, key=lambda r: r.timestamp):
+                        self.hass.bus.async_fire(
+                            EVENT_NEW_MEASUREMENT,
+                            {
+                                "device_address": self.address,
+                                "systolic": result.systolic,
+                                "diastolic": result.diastolic,
+                                "mean_arterial_pressure": result.mean_arterial_pressure,
+                                "heart_rate": result.heart_rate,
+                                "pulse_pressure": result.pulse_pressure,
+                                "timestamp": result.timestamp_str,
+                                "user_id": result.user_id,
+                                "patient": self.user_names.get(result.user_id, ""),
+                                "irregular_heartbeat": result.irregular_heartbeat,
+                            },
+                        )
                 self._file_data_buffer.clear()
             self._all_files_done.set()
 

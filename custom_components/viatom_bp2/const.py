@@ -2,6 +2,7 @@
 
 DOMAIN = "viatom_bp2"
 MANUFACTURER = "Viatom / Checkme"
+EVENT_NEW_MEASUREMENT = f"{DOMAIN}_new_measurement"
 
 # BLE UUIDs (from Viatom LepuDemo SDK)
 SERVICE_UUID = "14839ac4-7d7e-415c-9a42-167340cf2339"
